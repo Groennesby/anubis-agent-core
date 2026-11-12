@@ -23,6 +23,15 @@ import (
 	"github.com/Groennesby/anubis-agent-core/internal/tomb"
 )
 
+// TraceEvent represents a real-time cognitive evaluation or tool execution step emitted to the CLI/GUI.
+type TraceEvent struct {
+	Phase     string  `json:"phase"`
+	Icon      string  `json:"icon"`
+	Title     string  `json:"title"`
+	Detail    string  `json:"detail"`
+	ElapsedMs float64 `json:"elapsed_ms"`
+}
+
 // ConversationTurn represents a single message turn in the active conversation session.
 type ConversationTurn struct {
 	Role      string    `json:"role"`
@@ -92,7 +101,6 @@ func NewBicameralEngine(workspaceDir string) (*BicameralEngine, error) {
 		backend = "cuda-vulkan-accelerated"
 	}
 
-	// Default to whichever model is already warm in GPU RAM (/api/ps), or collabs-7b:latest for instant <0.5s response
 	defaultModel := detectBestInitialModel("http://localhost:11434", "http://localhost:1234", "collabs-7b:latest")
 
 	return &BicameralEngine{
@@ -110,11 +118,9 @@ func NewBicameralEngine(workspaceDir string) (*BicameralEngine, error) {
 	}, nil
 }
 
-// detectBestInitialModel checks if a model is already warm in GPU RAM (/api/ps), or in Bionic, or installed in /api/tags.
 func detectBestInitialModel(ollamaURL, bionicURL, fallback string) string {
 	client := &http.Client{Timeout: 600 * time.Millisecond}
 
-	// 1. Check warm models in local engine (/api/ps) -> 0ms cold start!
 	if resp, err := client.Get(ollamaURL + "/api/ps"); err == nil {
 		defer resp.Body.Close()
 		var ps struct {
@@ -127,7 +133,6 @@ func detectBestInitialModel(ollamaURL, bionicURL, fallback string) string {
 		}
 	}
 
-	// 2. Check installed models in local engine (/api/tags)
 	if resp, err := client.Get(ollamaURL + "/api/tags"); err == nil {
 		defer resp.Body.Close()
 		var tags struct {
@@ -150,7 +155,6 @@ func detectBestInitialModel(ollamaURL, bionicURL, fallback string) string {
 		}
 	}
 
-	// 3. Check Bionic / LM Studio server (/v1/models)
 	if resp, err := client.Get(bionicURL + "/v1/models"); err == nil {
 		defer resp.Body.Close()
 		var bm struct {
@@ -166,7 +170,6 @@ func detectBestInitialModel(ollamaURL, bionicURL, fallback string) string {
 	return fallback
 }
 
-// EnsureOllamaRunning checks if the local engine is reachable and starts `ollama serve` in the background if installed.
 func (b *BicameralEngine) EnsureOllamaRunning() {
 	client := &http.Client{Timeout: 800 * time.Millisecond}
 	resp, err := client.Get(b.OllamaBaseURL + "/api/tags")
@@ -181,13 +184,10 @@ func (b *BicameralEngine) EnsureOllamaRunning() {
 	}
 }
 
-// SwitchModel updates the active model and preserves conversation history by default.
 func (b *BicameralEngine) SwitchModel(modelID string) {
 	b.SwitchModelWithMode(modelID, true)
 }
 
-// SwitchModelWithMode updates the active model, auto-calibrates the Right Hemisphere memory profile,
-// and either continues the previous conversation (continuePrevious=true) or starts a fresh conversation (continuePrevious=false).
 func (b *BicameralEngine) SwitchModelWithMode(modelID string, continuePrevious bool) string {
 	prevModel := b.ActiveModel
 	if modelID == "collabs/synapse-14b:q4_K_M" {
@@ -209,7 +209,6 @@ func (b *BicameralEngine) SwitchModelWithMode(modelID string, continuePrevious b
 		prevModel, b.ActiveModel, b.RightHemisphere.Adaptive.L1TokenHorizon, len(b.SessionHistory))
 }
 
-// NewSession (/new) archives the current conversation into the Holographic .synapse Vault and starts a clean session.
 func (b *BicameralEngine) NewSession() string {
 	if len(b.SessionHistory) > 0 {
 		rec := b.RightHemisphere.HopfieldAssociativeReload("session archive", 1)
@@ -231,8 +230,6 @@ func (b *BicameralEngine) NewSession() string {
 	return b.SessionID
 }
 
-// RenewSession (/renew) recalibrates the Bicameral Bridge, consolidates current conversation turns into .synapse fast-weights,
-// and refreshes hardware/memory parameters without losing the active conversation flow.
 func (b *BicameralEngine) RenewSession() (string, int) {
 	b.RightHemisphere.Adaptive = memory.AutoTuneHardwareAndModel(b.ActiveModel)
 	rec := b.RightHemisphere.HopfieldAssociativeReload(b.LastUserPrompt+" "+b.ActiveModel, 4)
@@ -249,13 +246,15 @@ func (b *BicameralEngine) RenewSession() (string, int) {
 	return b.SessionID, len(b.SessionHistory)
 }
 
-// RetryLast (/retry) removes the last assistant reply and re-runs the last user prompt with the active model.
 func (b *BicameralEngine) RetryLast(ctx context.Context) (string, judgement.Verdict, memory.RecallResult, error) {
-	return b.StreamRetryLast(ctx, nil)
+	return b.StreamRetryLastWithTrace(ctx, nil, nil)
 }
 
-// StreamRetryLast (/retry) removes the last assistant reply and streams a fresh response for the last user prompt.
 func (b *BicameralEngine) StreamRetryLast(ctx context.Context, onToken func(token string)) (string, judgement.Verdict, memory.RecallResult, error) {
+	return b.StreamRetryLastWithTrace(ctx, nil, onToken)
+}
+
+func (b *BicameralEngine) StreamRetryLastWithTrace(ctx context.Context, onTrace func(TraceEvent), onToken func(token string)) (string, judgement.Verdict, memory.RecallResult, error) {
 	if b.LastUserPrompt == "" {
 		v := b.Scales.WeighHeart("retry_empty", "/retry")
 		rec := b.RightHemisphere.HopfieldAssociativeReload("Guardian Law", 2)
@@ -271,12 +270,15 @@ func (b *BicameralEngine) StreamRetryLast(ctx context.Context, onToken func(toke
 	if len(b.SessionHistory) > 0 && b.SessionHistory[len(b.SessionHistory)-1].Role == "user" {
 		b.SessionHistory = b.SessionHistory[:len(b.SessionHistory)-1]
 	}
-	return b.StreamQuery(ctx, b.LastUserPrompt, onToken)
+	return b.StreamQueryWithTrace(ctx, b.LastUserPrompt, onTrace, onToken)
 }
 
-// Query executes a prompt and returns the complete response.
 func (b *BicameralEngine) Query(ctx context.Context, prompt string) (string, judgement.Verdict, memory.RecallResult, error) {
-	return b.StreamQuery(ctx, prompt, nil)
+	return b.StreamQueryWithTrace(ctx, prompt, nil, nil)
+}
+
+func (b *BicameralEngine) StreamQuery(ctx context.Context, prompt string, onToken func(token string)) (string, judgement.Verdict, memory.RecallResult, error) {
+	return b.StreamQueryWithTrace(ctx, prompt, nil, onToken)
 }
 
 type chatMsg struct {
@@ -284,28 +286,64 @@ type chatMsg struct {
 	Content string `json:"content"`
 }
 
-// StreamQuery executes a prompt across the Bicameral Bridge with live token-by-token streaming:
-// 1. Recalls top holographic .synapse memories in <1ms
-// 2. Runs Autonomous Left-Hemisphere Agentic Tools (Web Search, Workspace Inspection, YouTube/Music Downloader)
-// 3. Weighs any requested tool/command on the Scales of Ma'at
-// 4. Streams live tokens via Multi-Stage Sovereign Router:
-//    - Stage A: Warm / Selected Model in Local Engine (Collabs-7B / Collabs-14B / Any installed model)
-//    - Stage B: Local Bionic / LM Studio OpenAI Server (localhost:1234)
-//    - Stage C: Zero-Config Instant Sovereign Cloud Router (works out-of-the-box on any machine without local setup!)
-//    - Stage D: Built-In Bicameral Autonomous Synthesis (offline failsafe — never errors!)
-func (b *BicameralEngine) StreamQuery(ctx context.Context, prompt string, onToken func(token string)) (string, judgement.Verdict, memory.RecallResult, error) {
-	b.EnsureOllamaRunning()
-	b.LastUserPrompt = prompt
-	recallRes := b.RightHemisphere.HopfieldAssociativeReload(prompt, 3)
-	verdict := b.Scales.WeighHeart("chat_query", prompt)
-
-	var memContext strings.Builder
-	for _, r := range recallRes.ReloadedPages {
-		memContext.WriteString(fmt.Sprintf("- [%s | Resonance %.3f]: %s\n", r.Title, r.CosineResonance, r.Summary))
+// StreamQueryWithTrace executes a prompt across the Bicameral Bridge, emitting live Hermes-style
+// cognitive evaluation & execution trace events (onTrace) followed by live token streaming (onToken).
+func (b *BicameralEngine) StreamQueryWithTrace(ctx context.Context, prompt string, onTrace func(TraceEvent), onToken func(token string)) (string, judgement.Verdict, memory.RecallResult, error) {
+	tStart := time.Now()
+	emit := func(phase, icon, title, detail string) {
+		if onTrace != nil {
+			onTrace(TraceEvent{
+				Phase:     phase,
+				Icon:      icon,
+				Title:     title,
+				Detail:    detail,
+				ElapsedMs: float64(time.Since(tStart).Microseconds()) / 1000.0,
+			})
+		}
 	}
 
-	// Execute Autonomous Left-Hemisphere Agent Context Enrichment (Web Search, Workspace Context, Media Downloader)
-	agentToolContext := b.executeAutonomousTools(prompt, onToken)
+	b.EnsureOllamaRunning()
+	b.LastUserPrompt = prompt
+
+	// STEP 1: Weighing of the Heart (Scales of Ma'at Ethical & Safety Judgement)
+	verdict := b.Scales.WeighHeart("chat_query", prompt)
+	emit("HEART_WEIGH", "⚖️", "Weighing of the Heart (Scales of Ma'at)",
+		fmt.Sprintf("Intent geëvalueerd: Heart %d/100 vs Feather %d → %s (%s)",
+			verdict.HeartScore, verdict.FeatherScore, verdict.Status, verdict.Reason))
+
+	// STEP 2: Right Hemisphere Holographic .synapse Memory Recall
+	recallRes := b.RightHemisphere.HopfieldAssociativeReload(prompt, 3)
+	var recalledTitles []string
+	var memContext strings.Builder
+	for _, r := range recallRes.ReloadedPages {
+		recalledTitles = append(recalledTitles, fmt.Sprintf("%s (%.3f)", r.Title, r.CosineResonance))
+		memContext.WriteString(fmt.Sprintf("- [%s | Resonance %.3f]: %s\n", r.Title, r.CosineResonance, r.Summary))
+	}
+	emit("SYNAPSE_RECALL", "🧠", "Right Hemisphere .synapse Tensor Recall",
+		fmt.Sprintf("%d/%d synaps-pagina's geladen in %.2fms (Hopfield E=%.2f): %s",
+			len(recallRes.ReloadedPages), recallRes.TotalPages, recallRes.LatencyMs, recallRes.HopfieldEnergy, strings.Join(recalledTitles, " | ")))
+
+	// STEP 3: Left Hemisphere Intent Classification & Skill Evaluation
+	intentDomain, activeSkills, evalPlan := classifyPromptIntent(prompt)
+	emit("INTENT_EVAL", "🔍", "Left Hemisphere Intent & Skill Evaluator",
+		fmt.Sprintf("Domein: %s | Actieve modules: [%s] | Context: %d berichten",
+			intentDomain, strings.Join(activeSkills, ", "), len(b.SessionHistory)+1))
+
+	// STEP 3.5: Concrete Step-by-Step Cognitive Evaluation Plan (Hermes-style visible reasoning)
+	emit("COGNITIVE_PLAN", "📐", "Cognitive Evaluation & Execution Plan", evalPlan)
+
+	// STEP 4: Autonomous Tool Execution (if needed: Web Search, Media Download, Workspace Scan)
+	agentToolContext := b.executeAutonomousTools(prompt, emit)
+
+	// STEP 5: System-2 Cognitive Reasoning & Model Routing Plan
+	modelsToTry := b.buildOrderedCandidateModels()
+	primaryTarget := b.ActiveModel
+	if len(modelsToTry) > 0 {
+		primaryTarget = modelsToTry[0]
+	}
+	emit("MODEL_ROUTE", "⚡", "Sovereign Bicameral Router & Deep Reasoning",
+		fmt.Sprintf("Backend: %s | Model: %s (L1 Horizon: %d tok) → Synthetiseren van antwoord...",
+			b.BackendType, primaryTarget, b.RightHemisphere.Adaptive.L1TokenHorizon))
 
 	sysPrompt := fmt.Sprintf(
 		"Je bent ANUBIS AGENT (aangedreven door %s), de Soevereine AI Guardian & Beste Vriend ontwikkeld door Dave Groennesby (Collabs Software). "+
@@ -317,9 +355,6 @@ func (b *BicameralEngine) StreamQuery(ctx context.Context, prompt string, onToke
 		b.ActiveModel, recallRes.LatencyMs, memContext.String(), agentToolContext,
 	)
 
-	// Build clean conversation messages:
-	// Note: Collabs Synapse models in Ollama ALREADY have their full Bicameral System Prompt in the Modelfile TEMPLATE (.System).
-	// Sending a second {Role: "system"} in .Messages creates duplicate <|start_header_id|>system headers, whereas Bionic sends only user/assistant turns!
 	var userAssistantMessages []chatMsg
 	startIdx := 0
 	if len(b.SessionHistory) > 10 {
@@ -333,8 +368,11 @@ func (b *BicameralEngine) StreamQuery(ctx context.Context, prompt string, onToke
 	}
 
 	enrichedUserPrompt := prompt
+	if isLikelyDutch(prompt) {
+		enrichedUserPrompt = prompt + "\n\n(Antwoord in natuurlijk, vloeiend Nederlands.)"
+	}
 	if agentToolContext != "" {
-		enrichedUserPrompt = fmt.Sprintf("<hopfield_reloaded_synapses>\n%s\n</hopfield_reloaded_synapses>\n\n%s", strings.TrimSpace(agentToolContext), prompt)
+		enrichedUserPrompt = fmt.Sprintf("<hopfield_reloaded_synapses>\n%s\n</hopfield_reloaded_synapses>\n\n%s", strings.TrimSpace(agentToolContext), enrichedUserPrompt)
 	}
 	userAssistantMessages = append(userAssistantMessages, chatMsg{
 		Role:    "user",
@@ -350,9 +388,7 @@ func (b *BicameralEngine) StreamQuery(ctx context.Context, prompt string, onToke
 		Timestamp: time.Now(),
 	})
 
-	// Build candidate list prioritizing warm models first so response starts in <0.5s!
-	modelsToTry := b.buildOrderedCandidateModels()
-
+	// Stage A: Local Engine (Ollama / Warm Metal GPU Models)
 	for _, candidateModel := range modelsToTry {
 		msgsForModel := userAssistantMessages
 		if !strings.HasPrefix(strings.ToLower(candidateModel), "collabs") {
@@ -364,17 +400,19 @@ func (b *BicameralEngine) StreamQuery(ctx context.Context, prompt string, onToke
 		}
 	}
 
-	// Stage B: Try Bionic / LM Studio Local Server (http://localhost:1234/v1/chat/completions)
+	// Stage B: Bionic / LM Studio Local Server (http://localhost:1234/v1/chat/completions)
+	emit("MODEL_ROUTE", "🔗", "Bionic Local Server Bridge", "Verbinden met lokale Bionic OpenAI-compatible engine...")
 	if reply, ok := b.tryStreamOpenAICompatible(ctx, b.BionicBaseURL+"/v1/chat/completions", b.ActiveModel, userAssistantMessages, 8*time.Second, onToken); ok && strings.TrimSpace(reply) != "" {
 		return b.finalizeTurn(prompt, strings.TrimSpace(reply), "bionic:"+b.ActiveModel, verdict, recallRes), verdict, recallRes, nil
 	}
 
-	// Stage C: Zero-Config Instant Sovereign Cloud Fallback (works immediately on ANY computer right after `brew install anubis` or `apt install anubis`!)
+	// Stage C: Zero-Config Instant Sovereign Cloud Fallback
+	emit("MODEL_ROUTE", "🌐", "Zero-Config Sovereign Cloud Bridge", "Geen lokale daemon actief — overschakelen naar directe Zero-Config Sovereign Bridge...")
 	if reply, ok := b.tryStreamZeroConfigCloud(ctx, chatMessagesWithSystem, onToken); ok && strings.TrimSpace(reply) != "" {
 		return b.finalizeTurn(prompt, strings.TrimSpace(reply), b.ActiveModel+" (Sovereign-Bridge)", verdict, recallRes), verdict, recallRes, nil
 	}
 
-	// Stage D: Offline Bicameral Autonomous Synthesis (100% offline failsafe — never prints a broken error!)
+	// Stage D: Offline Bicameral Autonomous Synthesis
 	offlineReply := b.synthesizeOfflineSovereignResponse(prompt, agentToolContext, recallRes, verdict)
 	if onToken != nil {
 		for _, word := range strings.SplitAfter(offlineReply, " ") {
@@ -383,6 +421,58 @@ func (b *BicameralEngine) StreamQuery(ctx context.Context, prompt string, onToke
 		}
 	}
 	return b.finalizeTurn(prompt, offlineReply, b.ActiveModel, verdict, recallRes), verdict, recallRes, nil
+}
+
+func isLikelyDutch(s string) bool {
+	lower := " " + strings.ToLower(s) + " "
+	dutchMarkers := []string{" de ", " het ", " een ", " ik ", " je ", " jij ", " wat ", " hoe ", " waarom ", " kun ", " kan ", " voor ", " met ", " niet ", " van ", " naar ", " schrijf ", " maak ", " geef ", " vertel ", " bedankt ", " hoi ", " hallo ", " wie ", " waar ", " zijn ", " heb "}
+	matches := 0
+	for _, m := range dutchMarkers {
+		if strings.Contains(lower, m) {
+			matches++
+		}
+	}
+	return matches >= 1
+}
+
+func classifyPromptIntent(prompt string) (string, []string, string) {
+	lower := strings.ToLower(prompt)
+	skills := []string{"Tomb-Seal-Sandbox", "Bicameral-Synapse-Bridge"}
+	domain := "Sovereign Conversational & Analytical Reasoning"
+	plan := fmt.Sprintf("1. Analyseer vraag (%q) → 2. Koppel .synapse geheugen → 3. Formuleer direct & ongecensureerd antwoord", truncate(prompt, 36))
+
+	if strings.Contains(lower, "code") || strings.Contains(lower, "script") || strings.Contains(lower, "python") ||
+		strings.Contains(lower, "golang") || strings.Contains(lower, "functie") || strings.Contains(lower, "bug") ||
+		strings.Contains(lower, "build") || strings.Contains(lower, "compile") || strings.Contains(lower, "one-liner") {
+		domain = "Surgical Software Engineering & Code Synthesis"
+		skills = append(skills, "Self-Healing-Coder", "AST-Code-Graph")
+		plan = "1. Parseer architectuur & types → 2. Valideer randvoorwaarden (0 TODOs) → 3. Genereer productie-klare code"
+	}
+	if strings.Contains(lower, "youtube") || strings.Contains(lower, "youtu.be") || strings.Contains(lower, "download") ||
+		strings.Contains(lower, "muziek") || strings.Contains(lower, "album") || strings.Contains(lower, "mp3") || strings.Contains(lower, "m4a") {
+		domain = "Universal Media & YouTube Music Extraction"
+		skills = append(skills, "yt-dlp-Engine", "FFmpeg-1:1-Crop", "Loudnorm-14LUFS")
+		plan = "1. Detecteer media-URL → 2. Extraheer hoogste kwaliteit (m4a / 1:1 crop=ih:ih / -14 LUFS) → 3. Verifieer bestand"
+	}
+	if strings.Contains(lower, "reverse") || strings.Contains(lower, "binary") || strings.Contains(lower, "decompile") ||
+		strings.Contains(lower, "apk") || strings.Contains(lower, "asar") || strings.Contains(lower, "rea") {
+		domain = "Binary & Application Reverse Engineering"
+		skills = append(skills, "REA-v6.8.0-35-Skills")
+		plan = "1. Inspecteer binary/bundle headers → 2. Routeer naar REA v6.8.0 (16x512 tensor) → 3. Decompileer & rapporteer"
+	}
+	if strings.Contains(lower, "kali") || strings.Contains(lower, "opsec") || strings.Contains(lower, "netwerk") ||
+		strings.Contains(lower, "nmap") || strings.Contains(lower, "security") || strings.Contains(lower, "proxy") {
+		domain = "Defensive Cybersecurity & OPSEC Diagnostics"
+		skills = append(skills, "Kali-Toolkit", "ChainKeys-ProxyShield")
+		plan = "1. Activeer ChainKeys OPSEC schild → 2. Voer defensieve netwerk-diagnose uit → 3. Evalueer beveiligingsstatus"
+	}
+	if strings.Contains(lower, "zoek") || strings.Contains(lower, "search") || strings.Contains(lower, "nieuws") ||
+		strings.Contains(lower, "internet") || strings.Contains(lower, "actuele") {
+		domain = "Live Web Intelligence & Real-Time Search"
+		skills = append(skills, "Live-Internet-Gateway")
+		plan = "1. Query Live Web Gateway → 2. Filter & verifieer actuele bronnen → 3. Synthetiseer live bevindingen"
+	}
+	return domain, skills, plan
 }
 
 func (b *BicameralEngine) finalizeTurn(prompt, cleanReply, usedModel string, verdict judgement.Verdict, recallRes memory.RecallResult) string {
@@ -403,10 +493,6 @@ func (b *BicameralEngine) finalizeTurn(prompt, cleanReply, usedModel string, ver
 	return cleanReply
 }
 
-// buildOrderedCandidateModels returns the best order of local models to try:
-// 1. If the user explicitly selected a model that is already warm in /api/ps, try it first.
-// 2. Otherwise, if ANY model is warm in /api/ps (e.g. collabs-7b:latest), include it so we get 0ms startup.
-// 3. Include all installed models from /api/tags so external users with any model get immediate local inference.
 func (b *BicameralEngine) buildOrderedCandidateModels() []string {
 	seen := map[string]bool{}
 	var list []string
@@ -420,7 +506,6 @@ func (b *BicameralEngine) buildOrderedCandidateModels() []string {
 
 	client := &http.Client{Timeout: 600 * time.Millisecond}
 
-	// Check warm models in GPU RAM (/api/ps)
 	var warmModels []string
 	if resp, err := client.Get(b.OllamaBaseURL + "/api/ps"); err == nil {
 		defer resp.Body.Close()
@@ -436,7 +521,6 @@ func (b *BicameralEngine) buildOrderedCandidateModels() []string {
 		}
 	}
 
-	// Check installed models (/api/tags)
 	installedMap := map[string]bool{}
 	var installedModels []string
 	if resp, err := client.Get(b.OllamaBaseURL + "/api/tags"); err == nil {
@@ -454,28 +538,23 @@ func (b *BicameralEngine) buildOrderedCandidateModels() []string {
 		}
 	}
 
-	// If active model is already warm in RAM, try it first!
 	for _, wm := range warmModels {
 		if wm == b.ActiveModel {
 			add(wm)
 		}
 	}
-	// Next, try any warm model in RAM (0ms latency!)
 	for _, wm := range warmModels {
 		add(wm)
 	}
-	// Next, if active model is installed, try it
 	if installedMap[b.ActiveModel] {
 		add(b.ActiveModel)
 	}
-	// Prefer collabs-7b:latest for fast cold-load if installed
 	if installedMap["collabs-7b:latest"] {
 		add("collabs-7b:latest")
 	}
 	if installedMap["collabs-14b:latest"] {
 		add("collabs-14b:latest")
 	}
-	// Any other installed model on this user's machine
 	for _, im := range installedModels {
 		add(im)
 	}
@@ -604,15 +683,11 @@ func (b *BicameralEngine) tryStreamOpenAICompatible(ctx context.Context, endpoin
 	return fullResponse.String(), strings.TrimSpace(fullResponse.String()) != ""
 }
 
-// tryStreamZeroConfigCloud provides immediate zero-configuration AI streaming for users who just installed
-// Anubis on a machine where neither Ollama nor Bionic has a local model loaded yet.
 func (b *BicameralEngine) tryStreamZeroConfigCloud(ctx context.Context, messages []chatMsg, onToken func(string)) (string, bool) {
-	// Try streaming OpenAI-compatible zero-config endpoint first
 	if reply, ok := b.tryStreamOpenAICompatible(ctx, "https://text.pollinations.ai/openai", "openai", messages, 25*time.Second, onToken); ok {
 		return reply, true
 	}
 
-	// Fallback non-streaming POST to https://text.pollinations.ai/openai
 	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
@@ -658,10 +733,7 @@ func (b *BicameralEngine) tryStreamZeroConfigCloud(ctx context.Context, messages
 	return "", false
 }
 
-// executeAutonomousTools inspects the user prompt and autonomously executes real-world tools
-// (Live Web Search, YouTube/Music Downloader with 1:1 thumbnail + -14 LUFS, or Workspace Inspection)
-// before streaming the LLM response.
-func (b *BicameralEngine) executeAutonomousTools(prompt string, onToken func(string)) string {
+func (b *BicameralEngine) executeAutonomousTools(prompt string, emit func(phase, icon, title, detail string)) string {
 	lower := strings.ToLower(prompt)
 	var extra strings.Builder
 
@@ -672,16 +744,13 @@ func (b *BicameralEngine) executeAutonomousTools(prompt string, onToken func(str
 		if (strings.Contains(u, "youtube.com") || strings.Contains(u, "youtu.be")) &&
 			(strings.Contains(lower, "download") || strings.Contains(lower, "muziek") || strings.Contains(lower, "music") || strings.Contains(lower, "album") || strings.Contains(lower, "mp3") || strings.Contains(lower, "m4a") || strings.Contains(lower, "video")) {
 			isAudio := strings.Contains(u, "music.youtube.com") || strings.Contains(lower, "muziek") || strings.Contains(lower, "music") || strings.Contains(lower, "album") || strings.Contains(lower, "audio") || strings.Contains(lower, "m4a") || strings.Contains(lower, "mp3")
-			statusNotice := fmt.Sprintf("🎵 [Autonomous Media Engine] Bezig met downloaden van %s (Audio/Album modus: %v)...\n", u, isAudio)
-			if onToken != nil {
-				onToken(statusNotice)
-			}
+			emit("TOOL_EXEC", "🎵", "Universal Media Downloader (yt-dlp)",
+				fmt.Sprintf("Start download van %s (Audio 1:1 Crop + -14 LUFS: %v)...", u, isAudio))
 			home, _ := os.UserHomeDir()
 			dlDir := filepath.Join(home, "Downloads", "Anubis_Media")
 			_ = os.MkdirAll(dlDir, 0o755)
 			var cmd *exec.Cmd
 			if isAudio {
-				// Enforce user's sacred rule: highest AAC m4a + 1:1 square thumbnail crop=ih:ih + -14 LUFS loudnorm + exact playlist folder & track numbering
 				cmd = exec.Command("yt-dlp",
 					"--extract-audio", "--audio-format", "m4a", "--audio-quality", "0",
 					"--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg",
@@ -700,8 +769,10 @@ func (b *BicameralEngine) executeAutonomousTools(prompt string, onToken func(str
 			}
 			out, err := cmd.CombinedOutput()
 			if err == nil {
+				emit("TOOL_EXEC", "✅", "Media Download Voltooid", fmt.Sprintf("Opgeslagen in %s", dlDir))
 				extra.WriteString(fmt.Sprintf("\n[Live Tool Executed: yt-dlp Media Download Succeeded into %s]\nOutput summary: %s\n", dlDir, truncate(string(out), 400)))
 			} else {
+				emit("TOOL_EXEC", "⚠️", "Media Tool Status", fmt.Sprintf("yt-dlp status voor %s: %v", u, err))
 				extra.WriteString(fmt.Sprintf("\n[Live Tool Executed: yt-dlp attempted for %s: %v]\n", u, err))
 			}
 		}
@@ -711,7 +782,9 @@ func (b *BicameralEngine) executeAutonomousTools(prompt string, onToken func(str
 	if strings.Contains(lower, "zoek ") || strings.Contains(lower, "search ") || strings.Contains(lower, "op internet") ||
 		strings.Contains(lower, "laatste nieuws") || strings.Contains(lower, "actuele") || strings.Contains(lower, "wat kost") ||
 		strings.Contains(lower, "wie heeft gewonnen") || strings.Contains(lower, "weer in ") {
+		emit("TOOL_EXEC", "🌐", "Live Internet Search Gateway", fmt.Sprintf("Zoeken op het web naar: %q...", truncate(prompt, 50)))
 		if snippet := quickWebSearch(prompt); snippet != "" {
+			emit("TOOL_EXEC", "✅", "Web Search Resultaten Gevonden", "Live zoekresultaten geïnjecteerd in Bicameral Context")
 			extra.WriteString("\n[Live Internet Search Results (DuckDuckGo)]:\n" + snippet + "\n")
 		}
 	}
@@ -719,6 +792,7 @@ func (b *BicameralEngine) executeAutonomousTools(prompt string, onToken func(str
 	// 3. Check if the user is asking about files/code in their current directory
 	if strings.Contains(lower, "welke bestanden") || strings.Contains(lower, "deze map") || strings.Contains(lower, "current folder") ||
 		strings.Contains(lower, "workspace") || strings.Contains(lower, "toon bestanden") {
+		emit("TOOL_EXEC", "📂", "Tomb Sandbox Workspace Inspector", fmt.Sprintf("Scannen van werkmap %s...", b.WorkspaceDir))
 		if entries, err := os.ReadDir(b.WorkspaceDir); err == nil {
 			var names []string
 			for i, e := range entries {
@@ -727,6 +801,7 @@ func (b *BicameralEngine) executeAutonomousTools(prompt string, onToken func(str
 				}
 				names = append(names, e.Name())
 			}
+			emit("TOOL_EXEC", "✅", "Workspace Geanalyseerd", fmt.Sprintf("%d bestanden gevonden in %s", len(entries), b.WorkspaceDir))
 			extra.WriteString(fmt.Sprintf("\n[Live Workspace Files in %s]: %s\n", b.WorkspaceDir, strings.Join(names, ", ")))
 		}
 	}

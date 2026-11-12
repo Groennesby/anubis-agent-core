@@ -10,6 +10,7 @@ import (
 
 type BicameralEngine = executor.BicameralEngine
 type ConversationTurn = executor.ConversationTurn
+type TraceEvent = executor.TraceEvent
 type Verdict = judgement.Verdict
 type ScalesOfMaat = judgement.ScalesOfMaat
 type BicameralVault = memory.BicameralVault
