@@ -48,27 +48,28 @@ var AvailableModels = []struct {
 	Label       string `json:"label"`
 	Description string `json:"description"`
 }{
-	// 1. LOCAL PREFERRED MODELS (100% Private on User Hardware)
+	// 1. LOCAL PREFERRED MODELS (100% Private on User Hardware — Collabs Synapse)
 	{"collabs-7b:latest", "Collabs Synapse-7B [LOKAAL VOORKEUR]", "Ultra-Fast Local 7.6B (0ms Warm Latency + ANUBIS_BRAIN.md)"},
 	{"collabs-14b:latest", "Collabs Synapse-14B [LOKAAL FLAGSHIP]", "Flagship Bicameral Local 14.8B (+ ANUBIS_BRAIN.md)"},
 	{"collabs-14b:deepthink", "Collabs Synapse-14B DeepThink [LOKAAL]", "System-2 Chain-of-Thought Local 14.8B (+ ANUBIS_BRAIN.md)"},
 	{"collabs-7b:deepthink", "Collabs Synapse-7B DeepThink [LOKAAL]", "System-2 Chain-of-Thought Local 7.6B (+ ANUBIS_BRAIN.md)"},
-	{"jaahas/gemma-2-9b-it-abliterated:latest", "Gemma-2-9B Abliterated [LOKAAL]", "Uncensored Local 9.2B (+ ANUBIS_BRAIN.md)"},
 
-	// 2. GOOGLE GEMINI MODELS (Pre-loaded with ANUBIS_BRAIN.md at Startup)
-	{"gemini-2.5-pro", "Google Gemini 2.5 Pro [BRAIN-SYNCED]", "Deep Coding, Reasoning & 2M Context (+ ANUBIS_BRAIN.md)"},
-	{"gemini-2.5-flash", "Google Gemini 2.5 Flash [BRAIN-SYNCED]", "Ultra-Fast Multimodal & Agentic (+ ANUBIS_BRAIN.md)"},
+	// 2. GOOGLE GEMINI 4.0 & 3.8 FRONTIER MODELS (Live Auto-Synced + Pre-loaded with ANUBIS_BRAIN.md)
+	{"gemini-4.0-pro", "Google Gemini 4.0 Pro [BRAIN-SYNCED]", "Flagship Deep Reasoning, Coding & Agentic (+ ANUBIS_BRAIN.md)"},
+	{"gemini-4.0-flash", "Google Gemini 4.0 Flash [BRAIN-SYNCED]", "Ultra-Fast Multimodal & Live Thinking (+ ANUBIS_BRAIN.md)"},
+	{"gemini-3.8-pro", "Google Gemini 3.8 Pro [BRAIN-SYNCED]", "High-Precision Architecture & Code Synthesis (+ ANUBIS_BRAIN.md)"},
+	{"gemini-3.8-flash", "Google Gemini 3.8 Flash [BRAIN-SYNCED]", "Low-Latency Agentic Execution (+ ANUBIS_BRAIN.md)"},
 
-	// 3. CHATGPT / OPENAI MODELS (Pre-loaded with ANUBIS_BRAIN.md at Startup)
-	{"chatgpt-4o", "ChatGPT / GPT-4o [BRAIN-SYNCED]", "OpenAI Flagship Omni Reasoning (+ ANUBIS_BRAIN.md)"},
-	{"o3-mini-high", "OpenAI o3-mini High [BRAIN-SYNCED]", "Surgical Coding & Math Reasoning (+ ANUBIS_BRAIN.md)"},
+	// 3. CHATGPT-5 / OPENAI o4 FRONTIER MODELS (Pre-loaded with ANUBIS_BRAIN.md)
+	{"chatgpt-5", "ChatGPT-5 / GPT-5 Omni [BRAIN-SYNCED]", "OpenAI Flagship Frontier Reasoning (+ ANUBIS_BRAIN.md)"},
+	{"o4-mini-high", "OpenAI o4-mini High [BRAIN-SYNCED]", "Surgical Coding & System-2 Math Reasoning (+ ANUBIS_BRAIN.md)"},
 
-	// 4. CLAUDE CODE / ANTHROPIC MODELS (Pre-loaded with ANUBIS_BRAIN.md at Startup)
-	{"claude-code-sonnet", "Claude Code / Claude 3.7 Sonnet [BRAIN-SYNCED]", "Agentic Software Engineering & Code (+ ANUBIS_BRAIN.md)"},
-	{"claude-3.5-haiku", "Claude 3.5 Haiku [BRAIN-SYNCED]", "High-Speed Code & Tool Execution (+ ANUBIS_BRAIN.md)"},
+	// 4. CLAUDE CODE 4.5 / ANTHROPIC FRONTIER MODELS (Pre-loaded with ANUBIS_BRAIN.md)
+	{"claude-code-4.5-sonnet", "Claude Code / Claude 4.5 Sonnet [BRAIN-SYNCED]", "Agentic Software Engineering & Code (+ ANUBIS_BRAIN.md)"},
+	{"claude-4.5-opus", "Claude 4.5 Opus [BRAIN-SYNCED]", "Deep Architecture & Complex Security Auditing (+ ANUBIS_BRAIN.md)"},
 
-	// 5. DEEPSEEK & AUTO-ROUTER
-	{"deepseek-r1", "DeepSeek-R1 Reasoning [BRAIN-SYNCED]", "Frontier Chain-of-Thought (+ ANUBIS_BRAIN.md)"},
+	// 5. DEEPSEEK-R2 & SOVEREIGN AUTO-ROUTER
+	{"deepseek-r2", "DeepSeek-R2 Reasoning [BRAIN-SYNCED]", "Frontier Chain-of-Thought (+ ANUBIS_BRAIN.md)"},
 	{"auto-router", "Sovereign Auto-Router [LOKAAL -> CLOUD]", "Prioritizes Local First + Seamless Cloud Brain Fallback"},
 }
 
@@ -383,6 +384,7 @@ func isCloudFrontierModel(modelID string) bool {
 	return strings.HasPrefix(lower, "gemini") ||
 		strings.HasPrefix(lower, "chatgpt") ||
 		strings.HasPrefix(lower, "gpt-") ||
+		strings.HasPrefix(lower, "o4-") ||
 		strings.HasPrefix(lower, "o3-") ||
 		strings.HasPrefix(lower, "claude") ||
 		strings.HasPrefix(lower, "deepseek")

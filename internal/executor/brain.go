@@ -140,19 +140,91 @@ func loadProviderKeysMap() map[string]string {
 	return out
 }
 
+// resolveLiveGeminiCandidates queries the Google Generative Language /v1beta/models endpoint
+// to discover currently active, non-decommissioned Gemini models (e.g., gemini-4.0-pro, gemini-3.8-pro, etc.)
+// and returns an ordered candidate list so an outdated or decommissioned model ID never fails.
+func resolveLiveGeminiCandidates(apiKey, requestedModel string) []string {
+	reqLower := strings.ToLower(strings.TrimSpace(requestedModel))
+	wantPro := strings.Contains(reqLower, "pro") || strings.Contains(reqLower, "ultra")
+
+	seen := map[string]bool{}
+	var candidates []string
+	add := func(m string) {
+		m = strings.TrimPrefix(strings.TrimSpace(m), "models/")
+		if m != "" && !seen[m] {
+			seen[m] = true
+			candidates = append(candidates, m)
+		}
+	}
+
+	// 1. Always try the exact requested model first
+	add(requestedModel)
+
+	// 2. Dynamically fetch live active models from Google's API so decommissioned models are bypassed automatically
+	client := &http.Client{Timeout: 3 * time.Second}
+	if resp, err := client.Get("https://generativelanguage.googleapis.com/v1beta/models?key=" + apiKey); err == nil {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		var list struct {
+			Models []struct {
+				Name                       string   `json:"name"`
+				SupportedGenerationMethods []string `json:"supportedGenerationMethods"`
+			} `json:"models"`
+		}
+		if json.Unmarshal(body, &list) == nil {
+			// Iterate in reverse so newest models returned by API are prioritized
+			for i := len(list.Models) - 1; i >= 0; i-- {
+				m := list.Models[i]
+				mLower := strings.ToLower(m.Name)
+				if !strings.Contains(mLower, "gemini") || strings.Contains(mLower, "embedding") || strings.Contains(mLower, "vision") {
+					continue
+				}
+				supportsGen := false
+				for _, method := range m.SupportedGenerationMethods {
+					if method == "generateContent" {
+						supportsGen = true
+						break
+					}
+				}
+				if !supportsGen {
+					continue
+				}
+				if wantPro && strings.Contains(mLower, "pro") {
+					add(m.Name)
+				} else if !wantPro && strings.Contains(mLower, "flash") {
+					add(m.Name)
+				}
+			}
+			for i := len(list.Models) - 1; i >= 0; i-- {
+				m := list.Models[i]
+				if strings.Contains(strings.ToLower(m.Name), "gemini") {
+					add(m.Name)
+				}
+			}
+		}
+	}
+
+	// 3. Frontier fallback chain (4.0 -> 3.8 -> latest aliases)
+	if wantPro {
+		for _, fb := range []string{"gemini-4.0-pro", "gemini-3.8-pro", "gemini-pro-latest"} {
+			add(fb)
+		}
+	} else {
+		for _, fb := range []string{"gemini-4.0-flash", "gemini-3.8-flash", "gemini-flash-latest"} {
+			add(fb)
+		}
+	}
+	return candidates
+}
+
 // TryDirectCloudProviderAPI attempts direct official API calls when the user has selected Gemini, ChatGPT, or Claude Code
 // and has an API key configured, injecting the full ANUBIS_BRAIN.md startup document!
 func (b *BicameralEngine) TryDirectCloudProviderAPI(ctx context.Context, modelID string, sysPromptWithBrain string, userMessages []chatMsg, onToken func(string)) (string, bool) {
 	lower := strings.ToLower(modelID)
 
-	// 1. GOOGLE GEMINI (gemini-2.5-pro, gemini-2.5-flash)
+	// 1. GOOGLE GEMINI FRONTIER (gemini-4.0-pro, gemini-4.0-flash, gemini-3.8-pro, gemini-3.8-flash + live auto-discovery)
 	if strings.HasPrefix(lower, "gemini") {
 		if key := GetProviderAPIKey("gemini"); key != "" {
-			apiModel := "gemini-2.5-flash"
-			if strings.Contains(lower, "pro") {
-				apiModel = "gemini-2.5-pro"
-			}
-			url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", apiModel, key)
 			var contents []map[string]any
 			for _, m := range userMessages {
 				role := "user"
@@ -170,121 +242,156 @@ func (b *BicameralEngine) TryDirectCloudProviderAPI(ctx context.Context, modelID
 				},
 				"contents": contents,
 			})
-			reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			if req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(payload)); err == nil {
+
+			for _, apiModel := range resolveLiveGeminiCandidates(key, modelID) {
+				url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", apiModel, key)
+				reqCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+				req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(payload))
+				if err != nil {
+					cancel()
+					continue
+				}
 				req.Header.Set("Content-Type", "application/json")
-				if resp, rErr := http.DefaultClient.Do(req); rErr == nil {
-					body, _ := io.ReadAll(resp.Body)
-					_ = resp.Body.Close()
-					var parsed struct {
-						Candidates []struct {
-							Content struct {
-								Parts []struct {
-									Text string `json:"text"`
-								} `json:"parts"`
-							} `json:"content"`
-						} `json:"candidates"`
-					}
-					if json.Unmarshal(body, &parsed) == nil && len(parsed.Candidates) > 0 && len(parsed.Candidates[0].Content.Parts) > 0 {
-						txt := strings.TrimSpace(parsed.Candidates[0].Content.Parts[0].Text)
-						if txt != "" {
-							if onToken != nil {
-								for _, w := range strings.SplitAfter(txt, " ") {
-									onToken(w)
-									time.Sleep(5 * time.Millisecond)
-								}
+				resp, rErr := http.DefaultClient.Do(req)
+				if rErr != nil {
+					cancel()
+					continue
+				}
+				body, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				cancel()
+				if resp.StatusCode != http.StatusOK {
+					continue
+				}
+				var parsed struct {
+					Candidates []struct {
+						Content struct {
+							Parts []struct {
+								Text string `json:"text"`
+							} `json:"parts"`
+						} `json:"content"`
+					} `json:"candidates"`
+				}
+				if json.Unmarshal(body, &parsed) == nil && len(parsed.Candidates) > 0 && len(parsed.Candidates[0].Content.Parts) > 0 {
+					txt := strings.TrimSpace(parsed.Candidates[0].Content.Parts[0].Text)
+					if txt != "" {
+						if onToken != nil {
+							for _, w := range strings.SplitAfter(txt, " ") {
+								onToken(w)
+								time.Sleep(5 * time.Millisecond)
 							}
-							return txt, true
 						}
+						return txt, true
 					}
 				}
 			}
 		}
 	}
 
-	// 2. OPENAI / CHATGPT (chatgpt-4o, o3-mini-high, gpt-4o)
-	if strings.HasPrefix(lower, "chatgpt") || strings.HasPrefix(lower, "gpt-") || strings.HasPrefix(lower, "o3-") {
+	// 2. OPENAI / CHATGPT FRONTIER (chatgpt-5, gpt-5, o4-mini-high + automatic fallback)
+	if strings.HasPrefix(lower, "chatgpt") || strings.HasPrefix(lower, "gpt-") || strings.HasPrefix(lower, "o4-") || strings.HasPrefix(lower, "o3-") {
 		if key := GetProviderAPIKey("openai"); key != "" {
-			apiModel := "gpt-4o"
-			if strings.Contains(lower, "o3") {
-				apiModel = "o3-mini"
+			candidates := []string{"gpt-5", "chatgpt-5", "o4-mini"}
+			if strings.Contains(lower, "o4") || strings.Contains(lower, "o3") {
+				candidates = []string{"o4-mini", "gpt-5"}
 			}
 			allMsgs := append([]chatMsg{{Role: "system", Content: sysPromptWithBrain}}, userMessages...)
-			reqBody, _ := json.Marshal(map[string]any{
-				"model":    apiModel,
-				"messages": allMsgs,
-			})
-			reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			if req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, "https://api.openai.com/v1/chat/completions", bytes.NewReader(reqBody)); err == nil {
+			for _, apiModel := range candidates {
+				reqBody, _ := json.Marshal(map[string]any{
+					"model":    apiModel,
+					"messages": allMsgs,
+				})
+				reqCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+				req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, "https://api.openai.com/v1/chat/completions", bytes.NewReader(reqBody))
+				if err != nil {
+					cancel()
+					continue
+				}
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("Authorization", "Bearer "+key)
-				if resp, rErr := http.DefaultClient.Do(req); rErr == nil {
-					body, _ := io.ReadAll(resp.Body)
-					_ = resp.Body.Close()
-					var parsed struct {
-						Choices []struct {
-							Message struct {
-								Content string `json:"content"`
-							} `json:"message"`
-						} `json:"choices"`
-					}
-					if json.Unmarshal(body, &parsed) == nil && len(parsed.Choices) > 0 {
-						txt := strings.TrimSpace(parsed.Choices[0].Message.Content)
-						if txt != "" {
-							if onToken != nil {
-								for _, w := range strings.SplitAfter(txt, " ") {
-									onToken(w)
-									time.Sleep(5 * time.Millisecond)
-								}
+				resp, rErr := http.DefaultClient.Do(req)
+				if rErr != nil {
+					cancel()
+					continue
+				}
+				body, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				cancel()
+				if resp.StatusCode != http.StatusOK {
+					continue
+				}
+				var parsed struct {
+					Choices []struct {
+						Message struct {
+							Content string `json:"content"`
+						} `json:"message"`
+					} `json:"choices"`
+				}
+				if json.Unmarshal(body, &parsed) == nil && len(parsed.Choices) > 0 {
+					txt := strings.TrimSpace(parsed.Choices[0].Message.Content)
+					if txt != "" {
+						if onToken != nil {
+							for _, w := range strings.SplitAfter(txt, " ") {
+								onToken(w)
+								time.Sleep(5 * time.Millisecond)
 							}
-							return txt, true
 						}
+						return txt, true
 					}
 				}
 			}
 		}
 	}
 
-	// 3. ANTHROPIC CLAUDE CODE (claude-code-sonnet, claude-3.5-haiku)
+	// 3. ANTHROPIC CLAUDE CODE FRONTIER (claude-code-4.5-sonnet, claude-4.5-opus)
 	if strings.HasPrefix(lower, "claude") {
 		if key := GetProviderAPIKey("claude"); key != "" {
-			apiModel := "claude-3-7-sonnet-latest"
-			if strings.Contains(lower, "haiku") {
-				apiModel = "claude-3-5-haiku-latest"
+			candidates := []string{"claude-4-5-sonnet-latest", "claude-4-5-opus-latest", "claude-sonnet-4-5"}
+			if strings.Contains(lower, "opus") {
+				candidates = []string{"claude-4-5-opus-latest", "claude-opus-4-5", "claude-4-5-sonnet-latest"}
 			}
-			reqBody, _ := json.Marshal(map[string]any{
-				"model":      apiModel,
-				"max_tokens": 4096,
-				"system":     sysPromptWithBrain,
-				"messages":   userMessages,
-			})
-			reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			if req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(reqBody)); err == nil {
+			for _, apiModel := range candidates {
+				reqBody, _ := json.Marshal(map[string]any{
+					"model":      apiModel,
+					"max_tokens": 4096,
+					"system":     sysPromptWithBrain,
+					"messages":   userMessages,
+				})
+				reqCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+				req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(reqBody))
+				if err != nil {
+					cancel()
+					continue
+				}
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("x-api-key", key)
 				req.Header.Set("anthropic-version", "2023-06-01")
-				if resp, rErr := http.DefaultClient.Do(req); rErr == nil {
-					body, _ := io.ReadAll(resp.Body)
-					_ = resp.Body.Close()
-					var parsed struct {
-						Content []struct {
-							Text string `json:"text"`
-						} `json:"content"`
-					}
-					if json.Unmarshal(body, &parsed) == nil && len(parsed.Content) > 0 {
-						txt := strings.TrimSpace(parsed.Content[0].Text)
-						if txt != "" {
-							if onToken != nil {
-								for _, w := range strings.SplitAfter(txt, " ") {
-									onToken(w)
-									time.Sleep(5 * time.Millisecond)
-								}
+				resp, rErr := http.DefaultClient.Do(req)
+				if rErr != nil {
+					cancel()
+					continue
+				}
+				body, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				cancel()
+				if resp.StatusCode != http.StatusOK {
+					continue
+				}
+				var parsed struct {
+					Content []struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				}
+				if json.Unmarshal(body, &parsed) == nil && len(parsed.Content) > 0 {
+					txt := strings.TrimSpace(parsed.Content[0].Text)
+					if txt != "" {
+						if onToken != nil {
+							for _, w := range strings.SplitAfter(txt, " ") {
+								onToken(w)
+								time.Sleep(5 * time.Millisecond)
 							}
-							return txt, true
 						}
+						return txt, true
 					}
 				}
 			}
