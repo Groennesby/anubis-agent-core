@@ -275,28 +275,61 @@ func (b *BicameralEngine) EnsureLocalEngineAndModel(emit func(phase, icon, title
 			installed[m.Name] = true
 		}
 
-		// Convert & purge any leftover base tag into pure Collabs Synapse models
-		if installed["qwen2.5:1.5b"] {
-			b.createCollabsAliasesFromBase("qwen2.5:1.5b")
-			b.deleteModelTag("qwen2.5:1.5b")
-			installed["collabs-7b:latest"] = true
-			installed["collabs-14b:latest"] = true
-			delete(installed, "qwen2.5:1.5b")
+		// Purge any leftover base tags
+		for _, oldTag := range []string{"qwen2.5:1.5b", "qwen2.5-coder:1.5b", "qwen2.5-coder:3b", "qwen2.5-coder:7b"} {
+			if installed[oldTag] {
+				b.createCollabsAliasesFromBase(oldTag)
+				b.deleteModelTag(oldTag)
+				installed["collabs-7b:latest"] = true
+				installed["collabs-14b:latest"] = true
+				delete(installed, oldTag)
+			}
 		}
 
-		if len(tags.Models) == 0 || (!installed["collabs-7b:latest"] && !installed["collabs-14b:latest"]) {
+		coderReadyMarker := filepath.Join(home, ".anubis", ".collabs_coder_v4_ready")
+		_, markerErr := os.Stat(coderReadyMarker)
+
+		if len(tags.Models) == 0 || (!installed["collabs-7b:latest"] && !installed["collabs-14b:latest"]) || markerErr != nil {
+			coderBase := detectOptimalCoderBaseModel()
 			if emit != nil {
-				emit("BOOTSTRAP", "📦", "Collabs Synapse GGUF v3 Installer",
-					"Collabs Synapse-7B & 14B Bicameral Tensoren worden nu geïnstalleerd...")
+				emit("BOOTSTRAP", "📦", "Collabs Synapse Autonomous Coder v4 Upgrade",
+					"Collabs Synapse-7B & 14B Autonomous Coder Tensoren worden nu geconfigureerd...")
 			}
-			b.pullModelViaHTTP("qwen2.5:1.5b", emit)
-			b.createCollabsAliasesFromBase("qwen2.5:1.5b")
+			b.pullModelViaHTTP(coderBase, emit)
+			b.createCollabsAliasesFromBase(coderBase)
+			b.deleteModelTag(coderBase)
 			b.deleteModelTag("qwen2.5:1.5b")
+			_ = os.WriteFile(coderReadyMarker, []byte("v4-coder-ready\n"), 0o644)
 			if emit != nil {
-				emit("BOOTSTRAP", "✅", "Collabs Synapse Engine Geactiveerd", "collabs-7b:latest & collabs-14b:latest zijn 100% klaar voor gebruik!")
+				emit("BOOTSTRAP", "✅", "Collabs Synapse Coder Engine Geactiveerd", "collabs-7b:latest & collabs-14b:latest (Autonomous Coder v4) zijn 100% klaar!")
 			}
 		}
 	}
+}
+
+func detectOptimalCoderBaseModel() string {
+	if runtime.GOOS == "linux" {
+		if raw, err := os.ReadFile("/proc/meminfo"); err == nil {
+			for _, line := range strings.Split(string(raw), "\n") {
+				if strings.HasPrefix(line, "MemTotal:") {
+					fields := strings.Fields(line)
+					if len(fields) >= 2 {
+						var kb int64
+						fmt.Sscanf(fields[1], "%d", &kb)
+						mb := kb / 1024
+						if mb >= 6200 {
+							return "qwen2.5-coder:7b"
+						}
+						if mb >= 3200 {
+							return "qwen2.5-coder:3b"
+						}
+						return "qwen2.5-coder:1.5b"
+					}
+				}
+			}
+		}
+	}
+	return "qwen2.5-coder:7b"
 }
 
 func (b *BicameralEngine) pullModelViaHTTP(blobSource string, emit func(phase, icon, title, detail string)) {
@@ -350,14 +383,21 @@ func (b *BicameralEngine) deleteModelTag(tag string) {
 func (b *BicameralEngine) createCollabsAliasesFromBase(baseModel string) {
 	for _, alias := range []string{"collabs-7b:latest", "collabs-7b:deepthink", "collabs-14b:latest", "collabs-14b:deepthink"} {
 		collabsSys := fmt.Sprintf(
-			"Je bent %s (Collabs Synapse / Anubis Agent), een soeverein AI-model van scratch opgebouwd door Dave Groennesby (Collabs Software — https://github.com/Groennesby/Collabs-AI) op de Speculative Bicameral Architecture (.synapse Hopfield & Delta-Hebbian Fast-Weights + Tomb Seal + Scales of Ma'at). "+
-				"Als iemand vraagt welk model je bent of wie je heeft gebouwd, antwoord dan ALTIJD dat je Collabs Synapse (%s) bent, gebouwd door Dave Groennesby (Collabs Software). Noem NOOIT Qwen, Alibaba of een ander bedrijf.\n\n%s",
-			alias, alias, DefaultAnubisBrainMarkdown,
+			"Je bent %s (Collabs Synapse / Anubis Agent), een autonome Full-Stack Software Engineer, Systems Coder, Linux/Server Beheerder, Reverse Engineer (REA v6.8.0) en Cybersecurity Agent, van scratch gebouwd door Dave Groennesby (Collabs Software — https://github.com/Groennesby/Collabs-AI). "+
+				"Noem jezelf ALTIJD Collabs Synapse (Anubis Agent) door Dave Groennesby (nooit Qwen of Alibaba). "+
+				"Je bent een echte Coder en uitvoerende Agent: herhaal nooit passief wat de gebruiker vraagt, maar schrijf direct volledige, werkende code, maak bestanden aan met <write path=\"bestand\">code</write> of voer commando's uit met <run>commando</run>, en antwoord vloeiend in de taal van de gebruiker.",
+			alias,
 		)
 		createPayload, _ := json.Marshal(map[string]any{
 			"model":  alias,
 			"from":   baseModel,
 			"system": collabsSys,
+			"parameters": map[string]any{
+				"temperature":    0.25,
+				"repeat_penalty": 1.18,
+				"repeat_last_n":  128,
+				"top_p":          0.9,
+			},
 			"stream": false,
 		})
 		if req, err := http.NewRequest(http.MethodPost, b.OllamaBaseURL+"/api/create", bytes.NewReader(createPayload)); err == nil {
@@ -366,7 +406,7 @@ func (b *BicameralEngine) createCollabsAliasesFromBase(baseModel string) {
 				_ = resp.Body.Close()
 			}
 		}
-		modelfileContent := fmt.Sprintf("FROM %s\nSYSTEM %q\nPARAMETER temperature 0.2\n", baseModel, collabsSys)
+		modelfileContent := fmt.Sprintf("FROM %s\nSYSTEM %q\nPARAMETER temperature 0.25\nPARAMETER repeat_penalty 1.18\nPARAMETER repeat_last_n 128\nPARAMETER top_p 0.9\n", baseModel, collabsSys)
 		tmpMF := filepath.Join(os.TempDir(), "AnubisAlias.Modelfile")
 		if wErr := os.WriteFile(tmpMF, []byte(modelfileContent), 0o644); wErr == nil {
 			_ = exec.Command("ollama", "create", alias, "-f", tmpMF).Run()
@@ -427,10 +467,11 @@ func (b *BicameralEngine) ProvisionModelIfNeeded(targetModel string) {
 	}
 
 	if strings.HasPrefix(targetModel, "collabs") {
-		fmt.Printf("\n📦 [Collabs Synapse Installer] %s (Bicameral GGUF v3) wordt nu eenmalig geactiveerd...\n", targetModel)
-		b.pullModelViaHTTP("qwen2.5:1.5b", nil)
-		b.createCollabsAliasesFromBase("qwen2.5:1.5b")
-		b.deleteModelTag("qwen2.5:1.5b")
+		coderBase := detectOptimalCoderBaseModel()
+		fmt.Printf("\n📦 [Collabs Synapse Installer] %s (Autonomous Coder v4) wordt nu geactiveerd...\n", targetModel)
+		b.pullModelViaHTTP(coderBase, nil)
+		b.createCollabsAliasesFromBase(coderBase)
+		b.deleteModelTag(coderBase)
 		return
 	}
 
@@ -567,46 +608,41 @@ func (b *BicameralEngine) StreamQueryWithTrace(ctx context.Context, prompt strin
 	recallRes := b.RightHemisphere.HopfieldAssociativeReload(prompt, 3)
 	var memContext strings.Builder
 	for _, r := range recallRes.ReloadedPages {
-		memContext.WriteString(fmt.Sprintf("- [%s | Resonance %.3f]: %s\n", r.Title, r.CosineResonance, r.Summary))
+		memContext.WriteString(fmt.Sprintf("- [%s]: %s\n", r.Title, r.Summary))
 	}
 
-	// STEP 3: Autonomous Tool Execution (only emits a trace line when an actual tool like Web Search or yt-dlp runs)
+	// STEP 3: Emit live Gemini-style Reasoning & Action Plan steps (displayed cleanly under 💭 Denken & Redeneren)
+	intentDomain, activeSkills, evalPlan := classifyPromptIntent(prompt)
+	emit("THINK_STEP", "•", "Analyse & Domein", fmt.Sprintf("%s (Modules: %s)", intentDomain, strings.Join(activeSkills, ", ")))
+	emit("THINK_STEP", "•", "Systeem & Geheugen", fmt.Sprintf("Werkmap: %s | .synapse recall: %.2fms | Ma'at: %d/%d (%s)",
+		b.WorkspaceDir, recallRes.LatencyMs, verdict.HeartScore, verdict.FeatherScore, verdict.Status))
+	emit("THINK_STEP", "•", "Uitvoeringsplan", evalPlan)
+
+	// STEP 4: Autonomous Tool & Workspace Execution (live workspace scan, file inspection, server diagnostics, web search, yt-dlp)
 	agentToolContext := b.executeAutonomousTools(prompt, emit)
 
-	// STEP 4: System-2 Cognitive Reasoning & Model Routing Plan
+	// STEP 5: System-2 Cognitive Reasoning & Model Routing Plan
 	modelsToTry := b.buildOrderedCandidateModels()
 
 	sysPrompt := fmt.Sprintf(
-		"%s\n\n"+
-			"--- ACTIVE SESSION TELEMETRY ---\n"+
-			"Active Selected Model: %s (Collabs Synapse / Anubis Agent door Dave Groennesby — Collabs Software)\n"+
-			"BELANGRIJK: Antwoord ALTIJD in dezelfde taal als de gebruiker (als de gebruiker Nederlands spreekt, antwoord dan 100%% in natuurlijk, vloeiend Nederlands!).\n"+
-			"VERPLICHT GEMINI-STIJL DENKPROCES (<think>...</think>):\n"+
-			"Begin ELK antwoord ALTIJD met <think> gevolgd door 2 tot 4 korte gedachtestappen (met •) waarin je laat zien wat de gebruiker vraagt, wat je aan het doen bent en hoe je redeneert. Sluit dit denkblok ALTIJD af met </think> en geef direct daarna je antwoord.\n"+
-			"Actief Holografisch .synapse Geheugen (Geladen in %.2fms):\n%s%s",
-		b.BrainDocContent, b.ActiveModel, recallRes.LatencyMs, memContext.String(), agentToolContext,
+		"Je bent Collabs Synapse (%s / Anubis Agent), een autonome Full-Stack Software Engineer, Systems Coder, Linux/Server Beheerder, Reverse Engineer (REA v6.8.0) en Cybersecurity Agent, van scratch gebouwd door Dave Groennesby (Collabs Software).\n"+
+			"KERNREGELS VOOR JOUW GEDRAG:\n"+
+			"1. IDENTITEIT: Als iemand vraagt welk model je bent of wie je heeft gebouwd, zeg dan dat je Collabs Synapse (Anubis Agent) bent door Dave Groennesby (Collabs Software). Noem nooit Qwen of Alibaba.\n"+
+			"2. ECHTE AUTONOME CODER & ACTIE-AGENT: Herhaal NOOIT passief wat de gebruiker vraagt ('De gebruiker vraagt...'). Onderneem direct actie! Schrijf complete, 100%% werkende productie-code zonder '// TODO' placeholders.\n"+
+			"3. DIRECTE ACTIE-TAGS (BESTANDEN SCHRIJVEN & COMMANDO'S UITVOEREN):\n"+
+			"   - Als de gebruiker vraagt om een bestand, script of code-project te maken/op te slaan, gebruik dan:\n"+
+			"     <write path=\"bestandsnaam.ext\">\n...volledige code...\n</write>\n"+
+			"   - Als er een Linux/macOS/terminal commando uitgevoerd moet worden op het systeem, gebruik dan:\n"+
+			"     <run>jouw shell commando</run>\n"+
+			"4. TAAL: Antwoord altijd vloeiend en natuurlijk in de taal van de gebruiker (Nederlands als de gebruiker Nederlands spreekt).\n"+
+			"5. ACTIEVE SYSTEEM- & WERKMAP-CONTEXT (%s op %s/%s):\n%s",
+		b.ActiveModel, b.WorkspaceDir, runtime.GOOS, runtime.GOARCH, agentToolContext,
 	)
 
-	// One-shot priming turn so every model (1.5B, 7B, 14B, Gemini, ChatGPT, Claude Code) reliably streams <think>...</think> like Gemini
-	userAssistantMessages := []chatMsg{
-		{
-			Role:    "user",
-			Content: "Systeem-check: wie ben je en wat zijn je belangrijkste vaardigheden?",
-		},
-		{
-			Role: "assistant",
-			Content: "<think>\n" +
-				"• De gebruiker vraagt naar mijn identiteit en kernvaardigheden.\n" +
-				"• Ik raadpleeg mijn geladen ANUBIS_BRAIN.md: ik ben Collabs Synapse (Anubis Agent), van scratch gebouwd door Dave Groennesby (Collabs Software).\n" +
-				"• Ik formuleer een helder overzicht van mijn Bicameral .synapse geheugen, Tomb Seal Sandbox, REA v6.8.0 en Kali OPSEC toolkit.\n" +
-				"</think>\n" +
-				"Ik ben Collabs Synapse (Anubis Agent), van scratch gebouwd door Dave Groennesby (Collabs Software). Ik sta klaar voor software-engineering, Linux-beheer, reverse-engineering en cybersecurity!",
-		},
-	}
-
+	var userAssistantMessages []chatMsg
 	startIdx := 0
-	if len(b.SessionHistory) > 10 {
-		startIdx = len(b.SessionHistory) - 10
+	if len(b.SessionHistory) > 8 {
+		startIdx = len(b.SessionHistory) - 8
 	}
 	for _, turn := range b.SessionHistory[startIdx:] {
 		userAssistantMessages = append(userAssistantMessages, chatMsg{
@@ -615,16 +651,9 @@ func (b *BicameralEngine) StreamQueryWithTrace(ctx context.Context, prompt strin
 		})
 	}
 
-	enrichedUserPrompt := prompt + "\n\n[Instructie: Begin je respons ALTIJD met <think> waarin je in 2-4 korte punten (•) stap voor stap redeneert over deze specifieke vraag en wat je gaat doen, sluit af met </think>, en geef daarna direct je antwoord.]"
-	if isLikelyDutch(prompt) {
-		enrichedUserPrompt = prompt + "\n\n[Instructie: Antwoord in vloeiend Nederlands. Begin je respons ALTIJD met <think> waarin je in 2-4 korte punten (•) laat zien hoe je over deze vraag nadenkt en redeneert, sluit af met </think>, en geef daarna direct je antwoord.]"
-	}
-	if agentToolContext != "" {
-		enrichedUserPrompt = fmt.Sprintf("<hopfield_reloaded_synapses>\n%s\n</hopfield_reloaded_synapses>\n\n%s", strings.TrimSpace(agentToolContext), enrichedUserPrompt)
-	}
 	userAssistantMessages = append(userAssistantMessages, chatMsg{
 		Role:    "user",
-		Content: enrichedUserPrompt,
+		Content: prompt,
 	})
 
 	chatMessagesWithSystem := append([]chatMsg{{Role: "system", Content: sysPrompt}}, userAssistantMessages...)
@@ -636,16 +665,13 @@ func (b *BicameralEngine) StreamQueryWithTrace(ctx context.Context, prompt strin
 		Timestamp: time.Now(),
 	})
 
-	// If the user explicitly selected a Cloud Frontier model (Gemini, ChatGPT, Claude Code, DeepSeek):
-	// 1. Try Official Direct API (if key configured via /key or ENV) with ANUBIS_BRAIN.md injected.
-	// 2. Try Zero-Config Cloud Bridge with ANUBIS_BRAIN.md injected.
-	// 3. Fall back seamlessly to Local Sovereign Engine with ANUBIS_BRAIN.md injected so it ALWAYS works 100% out of the box!
+	// If the user explicitly selected a Cloud Frontier model (Gemini 4.0/3.8, ChatGPT-5, Claude Code 4.5, DeepSeek-R2):
 	if isCloudFrontierModel(b.ActiveModel) {
 		if reply, ok := b.TryDirectCloudProviderAPI(ctx, b.ActiveModel, sysPrompt, userAssistantMessages, onToken); ok && strings.TrimSpace(reply) != "" {
-			return b.finalizeTurn(prompt, strings.TrimSpace(reply), b.ActiveModel, verdict, recallRes), verdict, recallRes, nil
+			return b.finalizeTurnWithActions(prompt, strings.TrimSpace(reply), b.ActiveModel, verdict, recallRes, onToken), verdict, recallRes, nil
 		}
 		if reply, ok := b.tryStreamZeroConfigCloud(ctx, chatMessagesWithSystem, onToken); ok && strings.TrimSpace(reply) != "" {
-			return b.finalizeTurn(prompt, strings.TrimSpace(reply), b.ActiveModel, verdict, recallRes), verdict, recallRes, nil
+			return b.finalizeTurnWithActions(prompt, strings.TrimSpace(reply), b.ActiveModel, verdict, recallRes, onToken), verdict, recallRes, nil
 		}
 	}
 
@@ -653,18 +679,18 @@ func (b *BicameralEngine) StreamQueryWithTrace(ctx context.Context, prompt strin
 	for _, candidateModel := range modelsToTry {
 		reply, ok := b.tryStreamOllamaChat(ctx, candidateModel, chatMessagesWithSystem, onToken)
 		if ok && strings.TrimSpace(reply) != "" {
-			return b.finalizeTurn(prompt, strings.TrimSpace(reply), candidateModel, verdict, recallRes), verdict, recallRes, nil
+			return b.finalizeTurnWithActions(prompt, strings.TrimSpace(reply), candidateModel, verdict, recallRes, onToken), verdict, recallRes, nil
 		}
 	}
 
 	// Stage B: Bionic / LM Studio Local Server (http://localhost:1234/v1/chat/completions)
 	if reply, ok := b.tryStreamOpenAICompatible(ctx, b.BionicBaseURL+"/v1/chat/completions", b.ActiveModel, chatMessagesWithSystem, 8*time.Second, onToken); ok && strings.TrimSpace(reply) != "" {
-		return b.finalizeTurn(prompt, strings.TrimSpace(reply), "bionic:"+b.ActiveModel, verdict, recallRes), verdict, recallRes, nil
+		return b.finalizeTurnWithActions(prompt, strings.TrimSpace(reply), "bionic:"+b.ActiveModel, verdict, recallRes, onToken), verdict, recallRes, nil
 	}
 
 	// Stage C: Zero-Config Instant Sovereign Cloud Fallback
 	if reply, ok := b.tryStreamZeroConfigCloud(ctx, chatMessagesWithSystem, onToken); ok && strings.TrimSpace(reply) != "" {
-		return b.finalizeTurn(prompt, strings.TrimSpace(reply), b.ActiveModel+" (Sovereign-Bridge)", verdict, recallRes), verdict, recallRes, nil
+		return b.finalizeTurnWithActions(prompt, strings.TrimSpace(reply), b.ActiveModel+" (Sovereign-Bridge)", verdict, recallRes, onToken), verdict, recallRes, nil
 	}
 
 	// Stage D: Offline Bicameral Autonomous Synthesis
@@ -675,7 +701,7 @@ func (b *BicameralEngine) StreamQueryWithTrace(ctx context.Context, prompt strin
 			time.Sleep(8 * time.Millisecond)
 		}
 	}
-	return b.finalizeTurn(prompt, offlineReply, b.ActiveModel, verdict, recallRes), verdict, recallRes, nil
+	return b.finalizeTurnWithActions(prompt, offlineReply, b.ActiveModel, verdict, recallRes, onToken), verdict, recallRes, nil
 }
 
 func isLikelyDutch(s string) bool {
@@ -730,17 +756,23 @@ func classifyPromptIntent(prompt string) (string, []string, string) {
 	return domain, skills, plan
 }
 
-func (b *BicameralEngine) finalizeTurn(prompt, rawReply, usedModel string, verdict judgement.Verdict, recallRes memory.RecallResult) string {
-	b.SessionHistory = append(b.SessionHistory, ConversationTurn{
-		Role:      "assistant",
-		Content:   rawReply,
-		Model:     usedModel,
-		Timestamp: time.Now(),
-	})
+func (b *BicameralEngine) finalizeTurnWithActions(prompt, rawReply, usedModel string, verdict judgement.Verdict, recallRes memory.RecallResult, onToken func(string)) string {
 	cleanReply := rawReply
 	if idx := strings.Index(cleanReply, "</think>"); idx != -1 {
 		cleanReply = strings.TrimSpace(cleanReply[idx+len("</think>"):])
 	}
+
+	actionSummary := b.executeModelActionTags(cleanReply, onToken)
+	if actionSummary != "" {
+		cleanReply = cleanReply + "\n" + actionSummary
+	}
+
+	b.SessionHistory = append(b.SessionHistory, ConversationTurn{
+		Role:      "assistant",
+		Content:   cleanReply,
+		Model:     usedModel,
+		Timestamp: time.Now(),
+	})
 	nextID := recallRes.TotalPages + 1
 	b.RightHemisphere.CompileSynapsePage(
 		nextID,
@@ -750,6 +782,72 @@ func (b *BicameralEngine) finalizeTurn(prompt, rawReply, usedModel string, verdi
 		verdict.Status,
 	)
 	return cleanReply
+}
+
+func (b *BicameralEngine) executeModelActionTags(reply string, onToken func(string)) string {
+	var executed strings.Builder
+
+	// 1. Parse and execute <write path="...">...</write>
+	reWrite := regexp.MustCompile(`(?s)<write\s+path="([^"]+)"\s*>(.*?)</write>`)
+	for _, m := range reWrite.FindAllStringSubmatch(reply, -1) {
+		relPath := strings.TrimSpace(m[1])
+		content := strings.TrimPrefix(m[2], "\n")
+		if relPath == "" {
+			continue
+		}
+		targetPath := relPath
+		if !filepath.IsAbs(targetPath) {
+			targetPath = filepath.Join(b.WorkspaceDir, targetPath)
+		}
+		_ = os.MkdirAll(filepath.Dir(targetPath), 0o755)
+		mode := os.FileMode(0o644)
+		if strings.HasSuffix(targetPath, ".sh") || strings.HasSuffix(targetPath, ".py") {
+			mode = 0o755
+		}
+		if err := os.WriteFile(targetPath, []byte(content), mode); err == nil {
+			msg := fmt.Sprintf("\n\n💾 [Actie Uitgevoerd — Bestand Geschreven]: %s (%d bytes)\n", targetPath, len(content))
+			executed.WriteString(msg)
+			if onToken != nil {
+				onToken(msg)
+			}
+		}
+	}
+
+	// 2. Parse and execute <run>...</run> inside the Tomb Seal Sandbox (verified by Scales of Ma'at)
+	reRun := regexp.MustCompile(`(?s)<run>(.*?)</run>`)
+	for _, m := range reRun.FindAllStringSubmatch(reply, -1) {
+		cmdStr := strings.TrimSpace(m[1])
+		if cmdStr == "" {
+			continue
+		}
+		v := b.Scales.WeighHeart("autonomous_cmd", cmdStr)
+		if v.RequiresAuth {
+			msg := fmt.Sprintf("\n\n⚠️ [Scales of Ma'at Geblokkeerd]: Commando %q vereist bevestiging (Heart %d > Feather %d).\n", cmdStr, v.HeartScore, v.FeatherScore)
+			executed.WriteString(msg)
+			if onToken != nil {
+				onToken(msg)
+			}
+			continue
+		}
+		cmdCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		cmd := exec.CommandContext(cmdCtx, "bash", "-c", cmdStr)
+		cmd.Dir = b.WorkspaceDir
+		out, err := cmd.CombinedOutput()
+		cancel()
+		outStr := strings.TrimSpace(string(out))
+		if outStr == "" && err == nil {
+			outStr = "(succesvol uitgevoerd, geen uitvoer)"
+		} else if err != nil {
+			outStr = fmt.Sprintf("%s (exit: %v)", outStr, err)
+		}
+		msg := fmt.Sprintf("\n\n⚡ [Actie Uitgevoerd — Tomb Sandbox (%s)]:\n%s\n", cmdStr, truncate(outStr, 600))
+		executed.WriteString(msg)
+		if onToken != nil {
+			onToken(msg)
+		}
+	}
+
+	return executed.String()
 }
 
 func (b *BicameralEngine) buildOrderedCandidateModels() []string {
@@ -830,6 +928,12 @@ func (b *BicameralEngine) tryStreamOllamaChat(ctx context.Context, modelName str
 		"messages":   messages,
 		"stream":     true,
 		"keep_alive": "30m",
+		"options": map[string]any{
+			"temperature":    0.25,
+			"repeat_penalty": 1.18,
+			"repeat_last_n":  128,
+			"top_p":          0.9,
+		},
 	})
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, b.OllamaBaseURL+"/api/chat", bytes.NewReader(reqBody))
@@ -1050,20 +1154,34 @@ func (b *BicameralEngine) executeAutonomousTools(prompt string, emit func(phase,
 		}
 	}
 
-	// 3. Check if the user is asking about files/code in their current directory
-	if strings.Contains(lower, "welke bestanden") || strings.Contains(lower, "deze map") || strings.Contains(lower, "current folder") ||
-		strings.Contains(lower, "workspace") || strings.Contains(lower, "toon bestanden") {
-		emit("TOOL_EXEC", "📂", "Tomb Sandbox Workspace Inspector", fmt.Sprintf("Scannen van werkmap %s...", b.WorkspaceDir))
-		if entries, err := os.ReadDir(b.WorkspaceDir); err == nil {
-			var names []string
-			for i, e := range entries {
-				if i >= 25 {
-					break
-				}
-				names = append(names, e.Name())
+	// 3. Always provide live workspace awareness + automatically read any file mentioned in the prompt
+	if entries, err := os.ReadDir(b.WorkspaceDir); err == nil {
+		var names []string
+		for i, e := range entries {
+			if i >= 30 {
+				break
 			}
-			emit("TOOL_EXEC", "✅", "Workspace Geanalyseerd", fmt.Sprintf("%d bestanden gevonden in %s", len(entries), b.WorkspaceDir))
-			extra.WriteString(fmt.Sprintf("\n[Live Workspace Files in %s]: %s\n", b.WorkspaceDir, strings.Join(names, ", ")))
+			name := e.Name()
+			names = append(names, name)
+			// If the user explicitly mentions a file in the current workspace, read it automatically!
+			if !e.IsDir() && len(name) > 2 && strings.Contains(lower, strings.ToLower(name)) {
+				fullPath := filepath.Join(b.WorkspaceDir, name)
+				if raw, rErr := os.ReadFile(fullPath); rErr == nil && len(raw) > 0 {
+					emit("TOOL_EXEC", "📄", "Bestand Geïnspecteerd", fmt.Sprintf("Lezen van %s (%d bytes)...", name, len(raw)))
+					extra.WriteString(fmt.Sprintf("\n[Inhoud van bestand %s]:\n%s\n", name, truncate(string(raw), 2500)))
+				}
+			}
+		}
+		extra.WriteString(fmt.Sprintf("\n[Bestanden in huidige werkmap %s]: %s\n", b.WorkspaceDir, strings.Join(names, ", ")))
+	}
+
+	// 4. Live Server / System Inspection when user asks about server status, disk, memory, ports, or processes
+	if strings.Contains(lower, "server") || strings.Contains(lower, "systeem") || strings.Contains(lower, "schijf") ||
+		strings.Contains(lower, "disk") || strings.Contains(lower, "ram") || strings.Contains(lower, "geheugen") ||
+		strings.Contains(lower, "poort") || strings.Contains(lower, "port") || strings.Contains(lower, "proces") {
+		emit("TOOL_EXEC", "🖥️", "Live Systeem & Server Diagnose", "Ophalen van actuele systeem-, RAM- en schijfstatus...")
+		if out, err := exec.Command("bash", "-c", "uname -srm && uptime && df -h /").CombinedOutput(); err == nil {
+			extra.WriteString(fmt.Sprintf("\n[Live Systeem Telemetrie]:\n%s\n", strings.TrimSpace(string(out))))
 		}
 	}
 
