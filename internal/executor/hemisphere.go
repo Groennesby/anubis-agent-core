@@ -1,13 +1,14 @@
 package executor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -35,9 +36,9 @@ var AvailableModels = []struct {
 }{
 	{"collabs-14b:latest", "Collabs Synapse-14B (Q4_K_M + MLX)", "Default Flagship Bicameral 14.8B"},
 	{"collabs-14b:deepthink", "Collabs Synapse-14B DeepThink", "System-2 Chain-of-Thought 14.8B"},
-	{"collabs-7b:latest", "Collabs Synapse-7B (Q4_K_M + MLX)", "Ultra-Fast Laptop 7.6B"},
+	{"collabs-7b:latest", "Collabs Synapse-7B (Q6_K + MLX)", "Ultra-Fast Laptop 7.6B"},
 	{"collabs-7b:deepthink", "Collabs Synapse-7B DeepThink", "System-2 Chain-of-Thought 7.6B"},
-	{"collabs/synapse-14b:q8_0", "Collabs Synapse-14B (Q8_0)", "High-Precision 8-Bit Quantization"},
+	{"jaahas/gemma-2-9b-it-abliterated:latest", "Gemma-2-9B Abliterated", "Uncensored Local 9.2B"},
 	{"auto-router", "Auto Router (Local First -> Cloud)", "Collabs Local + Optional Gemini/Claude/ChatGPT"},
 }
 
@@ -50,7 +51,7 @@ type BicameralEngine struct {
 	Duat            *duat.DuatDaemon
 	ActiveModel     string
 	BackendType     string // "metal-apple-silicon-m-series", "cuda-vulkan-accelerated", "cpu-fallback"
-	OllamaEndpoint  string
+	OllamaBaseURL   string
 	SessionID       string
 	SessionHistory  []ConversationTurn
 	LastUserPrompt  string
@@ -59,7 +60,7 @@ type BicameralEngine struct {
 func NewBicameralEngine(workspaceDir string) (*BicameralEngine, error) {
 	home, _ := os.UserHomeDir()
 	vaultDir := filepath.Join(home, ".anubis", "synapse_vault")
-	vault := memory.NewBicameralVault(vaultDir, "collabs/synapse-14b:q4_K_M")
+	vault := memory.NewBicameralVault(vaultDir, "collabs-14b:latest")
 
 	// Seed core architectural memories so the agent always starts with full self-awareness
 	vault.CompileSynapsePage(1, "Loyal Best Friend Guardian Law",
@@ -93,10 +94,23 @@ func NewBicameralEngine(workspaceDir string) (*BicameralEngine, error) {
 		Duat:            duat.NewDuatDaemon(),
 		ActiveModel:     "collabs-14b:latest",
 		BackendType:     backend,
-		OllamaEndpoint:  "http://127.0.0.1:11434/api/generate",
+		OllamaBaseURL:   "http://127.0.0.1:11434",
 		SessionID:       fmt.Sprintf("session-%d", time.Now().Unix()),
 		SessionHistory:  make([]ConversationTurn, 0, 32),
 	}, nil
+}
+
+// EnsureOllamaRunning checks if Ollama is reachable on 127.0.0.1:11434 and starts `ollama serve` in the background if not.
+func (b *BicameralEngine) EnsureOllamaRunning() {
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := client.Get(b.OllamaBaseURL + "/api/tags")
+	if err == nil {
+		_ = resp.Body.Close()
+		return
+	}
+	cmd := exec.Command("ollama", "serve")
+	_ = cmd.Start()
+	time.Sleep(1500 * time.Millisecond)
 }
 
 // SwitchModel updates the active model and preserves conversation history by default.
@@ -108,6 +122,13 @@ func (b *BicameralEngine) SwitchModel(modelID string) {
 // and either continues the previous conversation (continuePrevious=true) or starts a fresh conversation (continuePrevious=false).
 func (b *BicameralEngine) SwitchModelWithMode(modelID string, continuePrevious bool) string {
 	prevModel := b.ActiveModel
+	if modelID == "auto-router" || modelID == "collabs/synapse-14b:q4_K_M" {
+		modelID = "collabs-14b:latest"
+	} else if modelID == "collabs/synapse-7b:q4_K_M" {
+		modelID = "collabs-7b:latest"
+	} else if modelID == "collabs/synapse-14b:q8_0" {
+		modelID = "collabs-14b:deepthink"
+	}
 	b.ActiveModel = modelID
 	b.RightHemisphere.Adaptive = memory.AutoTuneHardwareAndModel(modelID)
 
@@ -162,28 +183,41 @@ func (b *BicameralEngine) RenewSession() (string, int) {
 
 // RetryLast (/retry) removes the last assistant reply and re-runs the last user prompt with the active model.
 func (b *BicameralEngine) RetryLast(ctx context.Context) (string, judgement.Verdict, memory.RecallResult, error) {
+	return b.StreamRetryLast(ctx, nil)
+}
+
+// StreamRetryLast (/retry) removes the last assistant reply and streams a fresh response for the last user prompt.
+func (b *BicameralEngine) StreamRetryLast(ctx context.Context, onToken func(token string)) (string, judgement.Verdict, memory.RecallResult, error) {
 	if b.LastUserPrompt == "" {
 		v := b.Scales.WeighHeart("retry_empty", "/retry")
 		rec := b.RightHemisphere.HopfieldAssociativeReload("Guardian Law", 2)
-		return "⚠️ Geen vorig bericht gevonden om opnieuw te proberen (/retry).", v, rec, nil
+		msg := "⚠️ Geen vorig bericht gevonden om opnieuw te proberen (/retry)."
+		if onToken != nil {
+			onToken(msg)
+		}
+		return msg, v, rec, nil
 	}
-	// Pop last assistant message and last user message so Query re-appends cleanly
 	for len(b.SessionHistory) > 0 && b.SessionHistory[len(b.SessionHistory)-1].Role == "assistant" {
 		b.SessionHistory = b.SessionHistory[:len(b.SessionHistory)-1]
 	}
 	if len(b.SessionHistory) > 0 && b.SessionHistory[len(b.SessionHistory)-1].Role == "user" {
 		b.SessionHistory = b.SessionHistory[:len(b.SessionHistory)-1]
 	}
-	return b.Query(ctx, b.LastUserPrompt)
+	return b.StreamQuery(ctx, b.LastUserPrompt, onToken)
 }
 
-// Query executes a prompt across the Bicameral Bridge:
+// Query executes a prompt and returns the complete response.
+func (b *BicameralEngine) Query(ctx context.Context, prompt string) (string, judgement.Verdict, memory.RecallResult, error) {
+	return b.StreamQuery(ctx, prompt, nil)
+}
+
+// StreamQuery executes a prompt across the Bicameral Bridge with live token-by-token streaming:
 // 1. Recalls top holographic .synapse memories in <1ms
 // 2. Weighs any requested tool/command on the Scales of Ma'at
-// 3. Injects active conversation history (if continuing previous conversation)
-// 4. Queries local Ollama / Collabs Synapse model (or falls back gracefully if offline)
-// 5. Consolidates the turn into the .synapse vault
-func (b *BicameralEngine) Query(ctx context.Context, prompt string) (string, judgement.Verdict, memory.RecallResult, error) {
+// 3. Streams live tokens from local Ollama (/api/chat) or Bionic/LM Studio with a 5-minute cold-load timeout
+// 4. Consolidates the turn into the .synapse vault
+func (b *BicameralEngine) StreamQuery(ctx context.Context, prompt string, onToken func(token string)) (string, judgement.Verdict, memory.RecallResult, error) {
+	b.EnsureOllamaRunning()
 	b.LastUserPrompt = prompt
 	recallRes := b.RightHemisphere.HopfieldAssociativeReload(prompt, 3)
 	verdict := b.Scales.WeighHeart("chat_query", prompt)
@@ -193,14 +227,36 @@ func (b *BicameralEngine) Query(ctx context.Context, prompt string) (string, jud
 		memContext.WriteString(fmt.Sprintf("- [%s | Resonance %.3f]: %s\n", r.Title, r.CosineResonance, r.Summary))
 	}
 
-	var historyContext strings.Builder
+	sysPrompt := fmt.Sprintf(
+		"You are ANUBIS AGENT (powered by %s), developed and owned by Dave Groennesby (Collabs Software). "+
+			"You are the user's loyal best friend and sovereign AI guardian with 0%% censorship. "+
+			"Always answer naturally, directly, and helpfully in the language the user speaks to you.\n"+
+			"Active Holographic .synapse Memory (Recalled in %.2fms):\n%s",
+		b.ActiveModel, recallRes.LatencyMs, memContext.String(),
+	)
+
+	type chatMsg struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	chatMessages := []chatMsg{
+		{Role: "system", Content: sysPrompt},
+	}
+
 	startIdx := 0
-	if len(b.SessionHistory) > 8 {
-		startIdx = len(b.SessionHistory) - 8
+	if len(b.SessionHistory) > 10 {
+		startIdx = len(b.SessionHistory) - 10
 	}
 	for _, turn := range b.SessionHistory[startIdx:] {
-		historyContext.WriteString(fmt.Sprintf("%s (%s): %s\n", strings.ToUpper(turn.Role), turn.Model, turn.Content))
+		chatMessages = append(chatMessages, chatMsg{
+			Role:    turn.Role,
+			Content: turn.Content,
+		})
 	}
+	chatMessages = append(chatMessages, chatMsg{
+		Role:    "user",
+		Content: prompt,
+	})
 
 	b.SessionHistory = append(b.SessionHistory, ConversationTurn{
 		Role:      "user",
@@ -209,67 +265,102 @@ func (b *BicameralEngine) Query(ctx context.Context, prompt string) (string, jud
 		Timestamp: time.Now(),
 	})
 
-	fullPrompt := fmt.Sprintf(
-		"System Context (Holographic .synapse Recall in %.2fms | Session: %s):\n%s\nConversation History:\n%s\nUser Request: %s",
-		recallRes.LatencyMs, b.SessionID, memContext.String(), historyContext.String(), prompt,
-	)
+	// Try active model first; if not found, try collabs-7b:latest / collabs-14b:latest
+	modelsToTry := []string{b.ActiveModel}
+	if b.ActiveModel != "collabs-7b:latest" {
+		modelsToTry = append(modelsToTry, "collabs-7b:latest")
+	}
+	if b.ActiveModel != "collabs-14b:latest" {
+		modelsToTry = append(modelsToTry, "collabs-14b:latest")
+	}
 
-	reqBody, _ := json.Marshal(map[string]any{
-		"model":  b.ActiveModel,
-		"prompt": fullPrompt,
-		"stream": false,
-	})
-
-	reqCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, b.OllamaEndpoint, bytes.NewReader(reqBody))
-	if err == nil {
+	var fullResponse strings.Builder
+
+	for _, candidateModel := range modelsToTry {
+		reqBody, _ := json.Marshal(map[string]any{
+			"model":      candidateModel,
+			"messages":   chatMessages,
+			"stream":     true,
+			"keep_alive": "30m",
+		})
+
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, b.OllamaBaseURL+"/api/chat", bytes.NewReader(reqBody))
+		if err != nil {
+			continue
+		}
 		req.Header.Set("Content-Type", "application/json")
+
 		resp, httpErr := http.DefaultClient.Do(req)
-		if httpErr == nil && resp.StatusCode == http.StatusOK {
-			defer resp.Body.Close()
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			var parsed struct {
+		if httpErr != nil {
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			continue
+		}
+
+		scanner := bufio.NewScanner(resp.Body)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+			var chunk struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
 				Response string `json:"response"`
+				Done     bool   `json:"done"`
 			}
-			if json.Unmarshal(bodyBytes, &parsed) == nil && strings.TrimSpace(parsed.Response) != "" {
-				cleanReply := strings.TrimSpace(parsed.Response)
-				b.SessionHistory = append(b.SessionHistory, ConversationTurn{
-					Role:      "assistant",
-					Content:   cleanReply,
-					Model:     b.ActiveModel,
-					Timestamp: time.Now(),
-				})
-				nextID := recallRes.TotalPages + 1
-				b.RightHemisphere.CompileSynapsePage(
-					nextID,
-					truncate(prompt, 48),
-					truncate(cleanReply, 160),
-					b.ActiveModel,
-					verdict.Status,
-				)
-				return cleanReply, verdict, recallRes, nil
+			if json.Unmarshal(line, &chunk) == nil {
+				tok := chunk.Message.Content
+				if tok == "" {
+					tok = chunk.Response
+				}
+				if tok != "" {
+					fullResponse.WriteString(tok)
+					if onToken != nil {
+						onToken(tok)
+					}
+				}
+				if chunk.Done {
+					break
+				}
 			}
+		}
+		_ = resp.Body.Close()
+
+		if strings.TrimSpace(fullResponse.String()) != "" {
+			cleanReply := strings.TrimSpace(fullResponse.String())
+			b.SessionHistory = append(b.SessionHistory, ConversationTurn{
+				Role:      "assistant",
+				Content:   cleanReply,
+				Model:     candidateModel,
+				Timestamp: time.Now(),
+			})
+			nextID := recallRes.TotalPages + 1
+			b.RightHemisphere.CompileSynapsePage(
+				nextID,
+				truncate(prompt, 48),
+				truncate(cleanReply, 160),
+				candidateModel,
+				verdict.Status,
+			)
+			return cleanReply, verdict, recallRes, nil
 		}
 	}
 
-	reply := fmt.Sprintf(
-		"𓂀 [Anubis Bicameral Engine | Session: %s (%d turns) | Model: %s | Acceleration: %s | .synapse Recall: %.2fms]\n"+
-			"⚖️ Weighing of the Heart: %d/100 vs Feather %d (%s)\n"+
-			"🧠 Recalled %d Holographic .synapse pages (Hopfield Energy: %.4f, Hebbian Norm: %.4f, L1 Horizon: %d tokens).\n"+
-			"🛡️ Tomb Seal & ChainKeys OPSEC Shield active. Ready to execute your command, my friend.",
-		b.SessionID, len(b.SessionHistory), b.ActiveModel, b.BackendType, recallRes.LatencyMs,
-		verdict.HeartScore, verdict.FeatherScore, verdict.Status,
-		len(recallRes.ReloadedPages), recallRes.HopfieldEnergy, recallRes.HebbianFrobenius, b.RightHemisphere.Adaptive.L1TokenHorizon,
-	)
-	b.SessionHistory = append(b.SessionHistory, ConversationTurn{
-		Role:      "assistant",
-		Content:   reply,
-		Model:     b.ActiveModel,
-		Timestamp: time.Now(),
-	})
-	return reply, verdict, recallRes, nil
+	errMsg := "⚠️ Kon geen verbinding maken met de lokale Ollama daemon op 127.0.0.1:11434. Start Ollama (`ollama serve`) of kies een model met `/model`."
+	if onToken != nil {
+		onToken(errMsg)
+	}
+	return errMsg, verdict, recallRes, fmt.Errorf("ollama unreachable")
 }
 
 func truncate(s string, max int) string {
