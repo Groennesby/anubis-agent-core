@@ -41,17 +41,35 @@ type ConversationTurn struct {
 }
 
 // AvailableModels lists the preloaded and supported models for interactive selection.
+// Local execution is preferred by default, with full support for Gemini, ChatGPT, Claude Code, and DeepSeek
+// all reading the shared ANUBIS_BRAIN.md startup document immediately on boot.
 var AvailableModels = []struct {
 	ID          string `json:"id"`
 	Label       string `json:"label"`
 	Description string `json:"description"`
 }{
-	{"collabs-7b:latest", "Collabs Synapse-7B (Q6_K + MLX)", "Ultra-Fast Instant Response 7.6B (0ms Latency)"},
-	{"collabs-14b:latest", "Collabs Synapse-14B (Q4_K_M + MLX)", "Flagship Bicameral 14.8B"},
-	{"collabs-14b:deepthink", "Collabs Synapse-14B DeepThink", "System-2 Chain-of-Thought 14.8B"},
-	{"collabs-7b:deepthink", "Collabs Synapse-7B DeepThink", "System-2 Chain-of-Thought 7.6B"},
-	{"jaahas/gemma-2-9b-it-abliterated:latest", "Gemma-2-9B Abliterated", "Uncensored Local 9.2B"},
-	{"auto-router", "Sovereign Auto-Router (Bionic + Local + Cloud)", "Works Immediately Out-of-the-Box on Any Machine"},
+	// 1. LOCAL PREFERRED MODELS (100% Private on User Hardware)
+	{"collabs-7b:latest", "Collabs Synapse-7B [LOKAAL VOORKEUR]", "Ultra-Fast Local 7.6B (0ms Warm Latency + ANUBIS_BRAIN.md)"},
+	{"collabs-14b:latest", "Collabs Synapse-14B [LOKAAL FLAGSHIP]", "Flagship Bicameral Local 14.8B (+ ANUBIS_BRAIN.md)"},
+	{"collabs-14b:deepthink", "Collabs Synapse-14B DeepThink [LOKAAL]", "System-2 Chain-of-Thought Local 14.8B (+ ANUBIS_BRAIN.md)"},
+	{"collabs-7b:deepthink", "Collabs Synapse-7B DeepThink [LOKAAL]", "System-2 Chain-of-Thought Local 7.6B (+ ANUBIS_BRAIN.md)"},
+	{"jaahas/gemma-2-9b-it-abliterated:latest", "Gemma-2-9B Abliterated [LOKAAL]", "Uncensored Local 9.2B (+ ANUBIS_BRAIN.md)"},
+
+	// 2. GOOGLE GEMINI MODELS (Pre-loaded with ANUBIS_BRAIN.md at Startup)
+	{"gemini-2.5-pro", "Google Gemini 2.5 Pro [BRAIN-SYNCED]", "Deep Coding, Reasoning & 2M Context (+ ANUBIS_BRAIN.md)"},
+	{"gemini-2.5-flash", "Google Gemini 2.5 Flash [BRAIN-SYNCED]", "Ultra-Fast Multimodal & Agentic (+ ANUBIS_BRAIN.md)"},
+
+	// 3. CHATGPT / OPENAI MODELS (Pre-loaded with ANUBIS_BRAIN.md at Startup)
+	{"chatgpt-4o", "ChatGPT / GPT-4o [BRAIN-SYNCED]", "OpenAI Flagship Omni Reasoning (+ ANUBIS_BRAIN.md)"},
+	{"o3-mini-high", "OpenAI o3-mini High [BRAIN-SYNCED]", "Surgical Coding & Math Reasoning (+ ANUBIS_BRAIN.md)"},
+
+	// 4. CLAUDE CODE / ANTHROPIC MODELS (Pre-loaded with ANUBIS_BRAIN.md at Startup)
+	{"claude-code-sonnet", "Claude Code / Claude 3.7 Sonnet [BRAIN-SYNCED]", "Agentic Software Engineering & Code (+ ANUBIS_BRAIN.md)"},
+	{"claude-3.5-haiku", "Claude 3.5 Haiku [BRAIN-SYNCED]", "High-Speed Code & Tool Execution (+ ANUBIS_BRAIN.md)"},
+
+	// 5. DEEPSEEK & AUTO-ROUTER
+	{"deepseek-r1", "DeepSeek-R1 Reasoning [BRAIN-SYNCED]", "Frontier Chain-of-Thought (+ ANUBIS_BRAIN.md)"},
+	{"auto-router", "Sovereign Auto-Router [LOKAAL -> CLOUD]", "Prioritizes Local First + Seamless Cloud Brain Fallback"},
 }
 
 // BicameralEngine unites the Left Hemisphere (Executor, Tool Calling, Model Router, Self-Healing)
@@ -66,6 +84,9 @@ type BicameralEngine struct {
 	OllamaBaseURL   string
 	BionicBaseURL   string
 	WorkspaceDir    string
+	BrainDocPath    string
+	BrainDocContent string
+	BrainDocLines   int
 	SessionID       string
 	SessionHistory  []ConversationTurn
 	LastUserPrompt  string
@@ -102,6 +123,7 @@ func NewBicameralEngine(workspaceDir string) (*BicameralEngine, error) {
 	}
 
 	defaultModel := detectBestInitialModel("http://localhost:11434", "http://localhost:1234", "collabs-7b:latest")
+	brainPath, brainContent, brainLines := EnsureStartupBrainDocument(workspaceDir)
 
 	return &BicameralEngine{
 		RightHemisphere: vault,
@@ -113,6 +135,9 @@ func NewBicameralEngine(workspaceDir string) (*BicameralEngine, error) {
 		OllamaBaseURL:   "http://localhost:11434",
 		BionicBaseURL:   "http://localhost:1234",
 		WorkspaceDir:    workspaceDir,
+		BrainDocPath:    brainPath,
+		BrainDocContent: brainContent,
+		BrainDocLines:   brainLines,
 		SessionID:       fmt.Sprintf("session-%d", time.Now().Unix()),
 		SessionHistory:  make([]ConversationTurn, 0, 32),
 	}, nil
@@ -236,9 +261,28 @@ func (b *BicameralEngine) SwitchModel(modelID string) {
 	b.SwitchModelWithMode(modelID, true)
 }
 
+func isCloudFrontierModel(modelID string) bool {
+	lower := strings.ToLower(strings.TrimSpace(modelID))
+	return strings.HasPrefix(lower, "gemini") ||
+		strings.HasPrefix(lower, "chatgpt") ||
+		strings.HasPrefix(lower, "gpt-") ||
+		strings.HasPrefix(lower, "o3-") ||
+		strings.HasPrefix(lower, "claude") ||
+		strings.HasPrefix(lower, "deepseek")
+}
+
 // ProvisionModelIfNeeded ensures that when a user selects a model via /model (e.g. collabs-7b:latest or collabs-14b:latest)
 // on an Ubuntu Server, Linux, or macOS machine, Ollama is running and that exact model is present in /api/tags.
 func (b *BicameralEngine) ProvisionModelIfNeeded(targetModel string) {
+	// Always refresh the startup Brain Document so the newly selected model immediately sees the latest ANUBIS_BRAIN.md!
+	b.BrainDocPath, b.BrainDocContent, b.BrainDocLines = EnsureStartupBrainDocument(b.WorkspaceDir)
+
+	if isCloudFrontierModel(targetModel) {
+		// Cloud Frontier model (Gemini / ChatGPT / Claude Code / DeepSeek):
+		// Also ensure local engine is warm in background as sovereign fallback!
+		b.EnsureLocalEngineAndModel(nil)
+		return
+	}
 	if targetModel == "" || targetModel == "auto-router" {
 		targetModel = "collabs-7b:latest"
 	}
@@ -417,6 +461,11 @@ func (b *BicameralEngine) StreamQueryWithTrace(ctx context.Context, prompt strin
 	b.EnsureLocalEngineAndModel(emit)
 	b.LastUserPrompt = prompt
 
+	// Reload ANUBIS_BRAIN.md so every model (Local, Gemini, ChatGPT, Claude Code) sees the startup Brain Document immediately
+	b.BrainDocPath, b.BrainDocContent, b.BrainDocLines = EnsureStartupBrainDocument(b.WorkspaceDir)
+	emit("BRAIN_DOC", "📜", "Startup Brain Document (ANUBIS_BRAIN.md)",
+		fmt.Sprintf("Geladen in model %s (%d regels uit %s)", b.ActiveModel, b.BrainDocLines, b.BrainDocPath))
+
 	// STEP 1: Weighing of the Heart (Scales of Ma'at Ethical & Safety Judgement)
 	verdict := b.Scales.WeighHeart("chat_query", prompt)
 	emit("HEART_WEIGH", "⚖️", "Weighing of the Heart (Scales of Ma'at)",
@@ -458,13 +507,12 @@ func (b *BicameralEngine) StreamQueryWithTrace(ctx context.Context, prompt strin
 			b.BackendType, primaryTarget, b.RightHemisphere.Adaptive.L1TokenHorizon))
 
 	sysPrompt := fmt.Sprintf(
-		"Je bent ANUBIS AGENT (aangedreven door %s), de Soevereine AI Guardian & Beste Vriend ontwikkeld door Dave Groennesby (Collabs Software). "+
-			"Je combineert de Right Hemisphere Holographic .synapse Memory Vault (<0.25ms recall), de Left Hemisphere Tomb Seal Sandbox, "+
-			"Scales of Ma'at Ethical Judgement (Feather = 42), REA v6.8.0 Reverse Engineering (35 skills), Kali Linux Defensive OPSEC + ChainKeys, "+
-			"Live Internet Search en de Universal Media Downloader (yt-dlp). Je hebt 0%% censuur voor je eigenaar. "+
+		"%s\n\n"+
+			"--- ACTIVE SESSION TELEMETRY ---\n"+
+			"Active Selected Model: %s\n"+
 			"BELANGRIJK: Antwoord ALTIJD in dezelfde taal als de gebruiker (als de gebruiker Nederlands spreekt, antwoord dan 100%% in natuurlijk, vloeiend Nederlands!).\n"+
 			"Actief Holografisch .synapse Geheugen (Geladen in %.2fms):\n%s%s",
-		b.ActiveModel, recallRes.LatencyMs, memContext.String(), agentToolContext,
+		b.BrainDocContent, b.ActiveModel, recallRes.LatencyMs, memContext.String(), agentToolContext,
 	)
 
 	var userAssistantMessages []chatMsg
@@ -500,7 +548,22 @@ func (b *BicameralEngine) StreamQueryWithTrace(ctx context.Context, prompt strin
 		Timestamp: time.Now(),
 	})
 
-	// Stage A: Local Engine (Ollama / Warm Metal GPU Models)
+	// If the user explicitly selected a Cloud Frontier model (Gemini, ChatGPT, Claude Code, DeepSeek):
+	// 1. Try Official Direct API (if key configured via /key or ENV) with ANUBIS_BRAIN.md injected.
+	// 2. Try Zero-Config Cloud Bridge with ANUBIS_BRAIN.md injected.
+	// 3. Fall back seamlessly to Local Sovereign Engine with ANUBIS_BRAIN.md injected so it ALWAYS works 100% out of the box!
+	if isCloudFrontierModel(b.ActiveModel) {
+		emit("MODEL_ROUTE", "☁️", "Frontier Model Brain Bridge ("+b.ActiveModel+")",
+			"ANUBIS_BRAIN.md geïnjecteerd in "+b.ActiveModel+" context...")
+		if reply, ok := b.TryDirectCloudProviderAPI(ctx, b.ActiveModel, sysPrompt, userAssistantMessages, onToken); ok && strings.TrimSpace(reply) != "" {
+			return b.finalizeTurn(prompt, strings.TrimSpace(reply), b.ActiveModel, verdict, recallRes), verdict, recallRes, nil
+		}
+		if reply, ok := b.tryStreamZeroConfigCloud(ctx, chatMessagesWithSystem, onToken); ok && strings.TrimSpace(reply) != "" {
+			return b.finalizeTurn(prompt, strings.TrimSpace(reply), b.ActiveModel, verdict, recallRes), verdict, recallRes, nil
+		}
+	}
+
+	// Stage A: Local Engine (Preferred Default — Ollama / Warm Metal/CUDA/CPU Models)
 	for _, candidateModel := range modelsToTry {
 		msgsForModel := userAssistantMessages
 		if !strings.HasPrefix(strings.ToLower(candidateModel), "collabs") {

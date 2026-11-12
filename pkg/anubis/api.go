@@ -26,3 +26,11 @@ var AvailableModels = executor.AvailableModels
 func NewBicameralEngine(workspaceDir string) (*BicameralEngine, error) {
 	return executor.NewBicameralEngine(workspaceDir)
 }
+
+func AppendBrainRule(rule string) (string, error) {
+	return executor.AppendBrainRule(rule)
+}
+
+func SaveProviderAPIKey(provider, apiKey string) error {
+	return executor.SaveProviderAPIKey(provider, apiKey)
+}
