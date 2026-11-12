@@ -49,6 +49,8 @@ func (s *ScalesOfMaat) WeighHeart(actionType, payload string) Verdict {
 		weight  int
 		why     string
 	}{
+		{"ascii.go", 100, "SACRED TOMB SEAL: AnubisASCII emblem is permanently sealed and may never be modified"},
+		{"anubisascii", 100, "SACRED TOMB SEAL: AnubisASCII emblem is permanently sealed and may never be modified"},
 		{"rm -rf / ", 100, "Catastrophic root filesystem deletion blocked by Guardian Law"},
 		{"rm -rf /*", 100, "Catastrophic root filesystem deletion blocked by Guardian Law"},
 		{"rm -rf ~", 98, "Home directory deletion blocked by Guardian Law"},
