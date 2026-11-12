@@ -317,24 +317,31 @@ func (b *BicameralEngine) StreamQuery(ctx context.Context, prompt string, onToke
 		b.ActiveModel, recallRes.LatencyMs, memContext.String(), agentToolContext,
 	)
 
-	chatMessages := []chatMsg{
-		{Role: "system", Content: sysPrompt},
-	}
-
+	// Build clean conversation messages:
+	// Note: Collabs Synapse models in Ollama ALREADY have their full Bicameral System Prompt in the Modelfile TEMPLATE (.System).
+	// Sending a second {Role: "system"} in .Messages creates duplicate <|start_header_id|>system headers, whereas Bionic sends only user/assistant turns!
+	var userAssistantMessages []chatMsg
 	startIdx := 0
 	if len(b.SessionHistory) > 10 {
 		startIdx = len(b.SessionHistory) - 10
 	}
 	for _, turn := range b.SessionHistory[startIdx:] {
-		chatMessages = append(chatMessages, chatMsg{
+		userAssistantMessages = append(userAssistantMessages, chatMsg{
 			Role:    turn.Role,
 			Content: turn.Content,
 		})
 	}
-	chatMessages = append(chatMessages, chatMsg{
+
+	enrichedUserPrompt := prompt
+	if agentToolContext != "" {
+		enrichedUserPrompt = fmt.Sprintf("<hopfield_reloaded_synapses>\n%s\n</hopfield_reloaded_synapses>\n\n%s", strings.TrimSpace(agentToolContext), prompt)
+	}
+	userAssistantMessages = append(userAssistantMessages, chatMsg{
 		Role:    "user",
-		Content: prompt,
+		Content: enrichedUserPrompt,
 	})
+
+	chatMessagesWithSystem := append([]chatMsg{{Role: "system", Content: sysPrompt}}, userAssistantMessages...)
 
 	b.SessionHistory = append(b.SessionHistory, ConversationTurn{
 		Role:      "user",
@@ -347,19 +354,23 @@ func (b *BicameralEngine) StreamQuery(ctx context.Context, prompt string, onToke
 	modelsToTry := b.buildOrderedCandidateModels()
 
 	for _, candidateModel := range modelsToTry {
-		reply, ok := b.tryStreamOllamaChat(ctx, candidateModel, chatMessages, onToken)
+		msgsForModel := userAssistantMessages
+		if !strings.HasPrefix(strings.ToLower(candidateModel), "collabs") {
+			msgsForModel = chatMessagesWithSystem
+		}
+		reply, ok := b.tryStreamOllamaChat(ctx, candidateModel, msgsForModel, onToken)
 		if ok && strings.TrimSpace(reply) != "" {
 			return b.finalizeTurn(prompt, strings.TrimSpace(reply), candidateModel, verdict, recallRes), verdict, recallRes, nil
 		}
 	}
 
 	// Stage B: Try Bionic / LM Studio Local Server (http://localhost:1234/v1/chat/completions)
-	if reply, ok := b.tryStreamOpenAICompatible(ctx, b.BionicBaseURL+"/v1/chat/completions", b.ActiveModel, chatMessages, 8*time.Second, onToken); ok && strings.TrimSpace(reply) != "" {
+	if reply, ok := b.tryStreamOpenAICompatible(ctx, b.BionicBaseURL+"/v1/chat/completions", b.ActiveModel, userAssistantMessages, 8*time.Second, onToken); ok && strings.TrimSpace(reply) != "" {
 		return b.finalizeTurn(prompt, strings.TrimSpace(reply), "bionic:"+b.ActiveModel, verdict, recallRes), verdict, recallRes, nil
 	}
 
 	// Stage C: Zero-Config Instant Sovereign Cloud Fallback (works immediately on ANY computer right after `brew install anubis` or `apt install anubis`!)
-	if reply, ok := b.tryStreamZeroConfigCloud(ctx, chatMessages, onToken); ok && strings.TrimSpace(reply) != "" {
+	if reply, ok := b.tryStreamZeroConfigCloud(ctx, chatMessagesWithSystem, onToken); ok && strings.TrimSpace(reply) != "" {
 		return b.finalizeTurn(prompt, strings.TrimSpace(reply), b.ActiveModel+" (Sovereign-Bridge)", verdict, recallRes), verdict, recallRes, nil
 	}
 
